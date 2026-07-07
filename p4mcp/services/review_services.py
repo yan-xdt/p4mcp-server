@@ -568,7 +568,13 @@ class ReviewServices:
 
         Comment-scoped: targets a comment by comment_id alone; review_id is
         neither required nor sent. Only the fields the caller supplies are
-        forwarded so omitted fields are left untouched on the server.
+        forwarded so omitted fields are left untouched on the server. Swarm
+        only allows the comment's author to edit it (403 otherwise).
+        task_state accepts "comment"|"open"|"addressed"|"verified". Swarm's
+        docs describe the flow open -> addressed -> verified, but live testing
+        against Swarm (API v11) showed the server does not enforce the
+        ordering; treat it as the recommended convention rather than a hard
+        constraint.
 
         Args:
             comment_id = "1234"
