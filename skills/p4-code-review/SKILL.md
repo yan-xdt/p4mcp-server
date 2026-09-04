@@ -11,11 +11,12 @@ Use the `query_reviews` and `modify_reviews` tools to manage P4 Code Review code
 
 | Action | Purpose | Key Parameters |
 |--------|---------|----------------|
-| `list` | List reviews with filters | `review_fields`, `max_results` |
+| `list` | List reviews with filters | `fields`, `max_results` |
 | `dashboard` | Get review dashboard for current user | — |
 | `get` | Get full review details | `review_id` |
 | `transitions` | Get available state transitions | `review_id` |
-| `files` | List files in a review | `review_id` |
+| `files` | List files in a review (metadata by default; set `structured=true` for hunks) | `review_id`, `from_version`, `to_version`, `structured` |
+| `diff` | Return structured, line-addressable hunks for a review version range | `review_id`, `from_version`, `to_version`, `context_lines` |
 | `files_readby` | Check which files have been read by reviewers | `review_id` |
 | `comments` | Get all comments on a review | `review_id` |
 | `activity` | Get review activity log | `review_id` |
@@ -100,3 +101,9 @@ Use the `query_reviews` and `modify_reviews` tools to manage P4 Code Review code
 - Use `files_readby` to track which reviewers have seen the latest changes.
 - Always `shelve` changes before creating a review so reviewers can see the diff.
 - Use `append_participants` rather than `replace_participants` to avoid removing existing reviewers.
+- For a structured diff, treat `versions[-1].change` as the latest source only
+  when that version is pending and its matching P4 shelf is verified; never use
+  `changes[0]` as a source fallback.
+- Structured diff lines may have a nullable semantic side for additions or
+  deletions. Swarm v11 inline comments still require both `leftLine` and
+  `rightLine` when a line context is supplied; do not POST a nullable side.

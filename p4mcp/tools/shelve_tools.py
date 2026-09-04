@@ -35,15 +35,40 @@ def register(server: "P4MCPServer") -> None:
             description="Filter by user - for list action",
             examples=["alice"],
         )] = None,
+        structured: Annotated[bool, Field(
+            default=False,
+            description=(
+                "For diff action, return line-addressable unified hunks; "
+                "false keeps the legacy raw list[str] response"
+            ),
+        )] = False,
+        context_lines: Annotated[int, Field(
+            default=3, ge=0, le=100,
+            description="Unchanged context lines requested for structured diff",
+        )] = 3,
+        max_files: Annotated[int, Field(
+            default=200, ge=1, le=1000,
+            description="Maximum files to expand in a structured shelf diff",
+        )] = 200,
+        max_bytes: Annotated[int, Field(
+            default=5_000_000, ge=1, le=100_000_000,
+            description="Maximum parsed bytes per file in a structured shelf diff",
+        )] = 5_000_000,
         max_results: Annotated[int, Field(
             default=100, ge=1, le=1000,
             description="Maximum number of results to return",
         )] = 100,
     ) -> dict:
-        """List shelves, get shelve diff and files (READ permission)"""
+        """List shelves, get shelve files, or a raw/structured diff (READ permission).
+
+        ``diff`` returns the legacy raw list when ``structured`` is false;
+        structured mode exposes conservative hunk and line-anchor records.
+        """
         params = m.QueryShelvesParams(
             action=action, changelist_id=changelist_id,
-            user=user, max_results=max_results,
+            user=user, structured=structured, context_lines=context_lines,
+            max_files=max_files, max_bytes=max_bytes,
+            max_results=max_results,
         )
         return await handle_with_logging(server, "query", "shelves", params, "query_shelves", ctx)
 
