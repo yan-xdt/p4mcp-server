@@ -19,7 +19,18 @@ class ShelvesHandlers:
         if params.action == "list":
             result = await self.shelve_services.list_shelves(params.user, params.max_results)
         elif params.action == "diff":
-            result = await self.shelve_services.get_shelve_diff(params.changelist_id)
+            if getattr(params, "structured", False):
+                result = await self.shelve_services.get_shelve_diff(
+                    params.changelist_id,
+                    structured=True,
+                    context_lines=getattr(params, "context_lines", 3),
+                    max_files=getattr(params, "max_files", 200),
+                    max_bytes=getattr(params, "max_bytes", 5_000_000),
+                )
+            else:
+                # Preserve the old one-argument call for downstream service
+                # implementations and test doubles.
+                result = await self.shelve_services.get_shelve_diff(params.changelist_id)
         elif params.action == "files":
             result = await self.shelve_services.get_shelve_files(params.changelist_id)
         else:

@@ -12,7 +12,7 @@ class ReviewsHandlers:
     async def _handle_query_reviews(self, params):
         actions_requiring_id = [
             "get", "transitions", "files_readby", "files",
-            "activity", "archive", "comments"
+            "activity", "archive", "comments", "diff"
         ]
 
         if params.action in actions_requiring_id and not params.review_id:
@@ -58,11 +58,35 @@ class ReviewsHandlers:
             )
 
         elif params.action == "files":
-            # get_review_files(review_id, from_version, to_version)
-            result = await self.review_services.get_review_files(
+            # Preserve the historical metadata response by default.  The
+            # shared `structured` flag is intentionally also honored for the
+            # files action so callers do not have to switch to a separate
+            # action merely to obtain line-addressable hunks.
+            if getattr(params, "structured", False):
+                result = await self.review_services.get_review_diff(
+                    params.review_id,
+                    getattr(params, "from_version", None),
+                    getattr(params, "to_version", None),
+                    getattr(params, "context_lines", 3),
+                    getattr(params, "max_files", 200),
+                    getattr(params, "max_bytes", 5_000_000),
+                )
+            else:
+                # get_review_files(review_id, from_version, to_version)
+                result = await self.review_services.get_review_files(
+                    params.review_id,
+                    getattr(params, "from_version", None),
+                    getattr(params, "to_version", None)
+                )
+
+        elif params.action == "diff":
+            result = await self.review_services.get_review_diff(
                 params.review_id,
                 getattr(params, "from_version", None),
-                getattr(params, "to_version", None)
+                getattr(params, "to_version", None),
+                getattr(params, "context_lines", 3),
+                getattr(params, "max_files", 200),
+                getattr(params, "max_bytes", 5_000_000),
             )
 
         elif params.action == "activity":

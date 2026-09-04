@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Optional, List, Literal, TYPE_CHECKING
 
-from pydantic import Field
+from pydantic import Field, StringConstraints
 from fastmcp import Context
 
 from ..models import review_models as review_m
@@ -24,13 +24,14 @@ def register(server: "P4MCPServer") -> None:
         action: Annotated[Literal[
             "list", "dashboard", "get", "transitions",
             "files_readby", "files", "comments", "activity",
+            "diff",
         ], Field(
-            description="Review query action: list all reviews, dashboard for current user, get specific review, transitions, files_readby, files, comments, activity"
+            description="Review query action: list all reviews, dashboard for current user, get specific review, transitions, files_readby, files, diff, comments, activity"
         )],
         ctx: Context,
         review_id: Annotated[Optional[int], Field(
             default=None,
-            description="Review ID - required for get, transitions, files_readby, files, comments, activity actions",
+            description="Review ID - required for get, transitions, files_readby, files, diff, comments, and activity actions",
             examples=[12345, 67890],
         )] = None,
         fields: Annotated[Optional[List[str]], Field(
@@ -50,14 +51,33 @@ def register(server: "P4MCPServer") -> None:
         )] = None,
         from_version: Annotated[Optional[int], Field(
             default=None,
-            description="Starting version for files action",
+            description="Starting version for files/diff actions (0 means the depot base)",
             examples=[1, 2],
         )] = None,
         to_version: Annotated[Optional[int], Field(
             default=None,
-            description="Ending version for files action",
+            description="Ending version for files/diff actions",
             examples=[2, 3],
         )] = None,
+        structured: Annotated[bool, Field(
+            default=False,
+            description=(
+                "For files, return hunks with left/right line anchors instead "
+                "of metadata only; diff always returns structured hunks"
+            ),
+        )] = False,
+        context_lines: Annotated[int, Field(
+            default=3, ge=0, le=100,
+            description="Number of unchanged context lines in structured diff hunks",
+        )] = 3,
+        max_files: Annotated[int, Field(
+            default=200, ge=1, le=1000,
+            description="Maximum number of files to expand in a structured diff",
+        )] = 200,
+        max_bytes: Annotated[int, Field(
+            default=5_000_000, ge=1, le=100_000_000,
+            description="Maximum bytes to read per file in a structured diff",
+        )] = 5_000_000,
         max_results: Annotated[int, Field(
             default=10,
             description="Maximum number of results to return",
@@ -102,7 +122,14 @@ def register(server: "P4MCPServer") -> None:
             description="Include allowed state transitions in get action response",
         )] = None,
     ) -> dict:
-        """Get review details and list reviews (READ permission).
+        """Get review details, files, and line-addressable diffs (READ permission).
+
+        ``action='files'`` keeps the historical metadata response unless
+        ``structured=true`` is supplied. ``action='diff'`` is an explicit
+        alias for that structured response. Structured entries include hunk
+        ranges and nullable left/right line anchors; binary or incomplete
+        files are marked unsupported rather than assigned synthetic anchors.
+
         Open review - state is 'approved but pending=true' or 'needsReview' or 'needsRevision'.
         Closed review - state is 'approved but pending=false' or 'rejected' or 'archived'.
         """
@@ -110,7 +137,8 @@ def register(server: "P4MCPServer") -> None:
             action=action, review_id=review_id,
             fields=fields, comments_fields=comments_fields,
             up_voters=up_voters, from_version=from_version,
-            to_version=to_version, max_results=max_results,
+            to_version=to_version, structured=structured, max_results=max_results,
+            context_lines=context_lines, max_files=max_files, max_bytes=max_bytes,
             after=after, after_updated=after_updated,
             result_order=result_order, projects=projects,
             state=state, keywords=keywords,
@@ -198,6 +226,11 @@ def register(server: "P4MCPServer") -> None:
             ge=1,
             description="Review version for comment attachment",
             examples=[1],
+        )] = None,
+        comment_content: Annotated[Optional[List[Annotated[str, StringConstraints(strip_whitespace=False)]]], Field(
+            default=None,
+            description="Code context lines for an inline comment; trailing newlines are preserved",
+            examples=[["line 1\n", "line 2\n"]],
         )] = None,
         vote_value: Annotated[Optional[Literal["up", "down", "clear"]], Field(
             default=None,
@@ -305,7 +338,8 @@ def register(server: "P4MCPServer") -> None:
 
         # Reconstruct comment context from flat fields
         comment_context = None
-        if any([comment_file_path, comment_left_line, comment_right_line, comment_version]):
+        if any([comment_file_path, comment_left_line, comment_right_line,
+                comment_version, comment_content]):
             # Build context dict dynamically - only include non-None fields
             context_dict = {}
             if comment_file_path is not None:
@@ -316,6 +350,8 @@ def register(server: "P4MCPServer") -> None:
                 context_dict["rightLine"] = comment_right_line
             if comment_version is not None:
                 context_dict["version"] = comment_version
+            if comment_content is not None:
+                context_dict["content"] = comment_content
             comment_context = review_m.CommentContext(**context_dict) if context_dict else None
 
         # Reconstruct users dict from flat fields
@@ -358,6 +394,7 @@ def register(server: "P4MCPServer") -> None:
             comment_left_line=comment_left_line,
             comment_right_line=comment_right_line,
             comment_version=comment_version,
+            comment_content=comment_content,
             participant_user_names=participant_user_names,
             participant_users_required=participant_users_required,
             participant_group_names=participant_group_names,

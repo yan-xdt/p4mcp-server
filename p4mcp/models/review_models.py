@@ -1,6 +1,6 @@
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 from .common import BaseParams, PaginatedParams
-from pydantic import Field, model_validator, field_validator
+from pydantic import Field, StringConstraints, model_validator, field_validator
 from enum import Enum
 import re
 
@@ -27,21 +27,23 @@ class ReviewAction(str, Enum):
     FILES = "files"
     ACTIVITY = "activity"
     COMMENTS = "comments"
+    DIFF = "diff"
 
 class QueryReviewsParams(PaginatedParams):
     """Review query parameters."""
 
     action: ReviewAction = Field(
         description=(
-            "Review query action: list all reviews."
+            "Review query action: list all reviews, dashboard, get, transitions, files, "
+            "files_readby, comments, activity, or diff. "
             "'dashboard' for current user (my reviews, needs my attention, authenticated user reviews), "
-            "get specific review, transitions, files_readby, files (from/to), comments"
+            "use structured=true with files (diff is always line-addressable) for hunks"
         ),
-        examples=["list", "dashboard", "get", "transitions", "files_readby", "files", "comments", "activity"],
+        examples=["list", "dashboard", "get", "transitions", "files_readby", "files", "diff", "comments", "activity"],
     )
     review_id: Optional[int] = Field(
         default=None,
-        description="Review ID—required for get, transitions, files_readby, files, comments, and activity actions",
+        description="Review ID—required for get, transitions, files_readby, files, comments, activity, and diff actions",
         examples=[12345, 67890],
     )
     fields: Optional[List[str]] = Field(
@@ -61,13 +63,41 @@ class QueryReviewsParams(PaginatedParams):
     )
     from_version: Optional[int] = Field(
         default=None,
-        description="Starting version for files action",
+        description="Starting version for files/diff action (0 means the depot base)",
         examples=[1, 2],
     )
     to_version: Optional[int] = Field(
         default=None,
-        description="Ending version for files action",
+        description="Ending version for files/diff action",
         examples=[2, 3],
+    )
+    structured: bool = Field(
+        default=False,
+        description=(
+            "For files, return line-addressable hunks when true; false preserves "
+            "the metadata-only response. The diff action is always structured."
+        ),
+    )
+    context_lines: int = Field(
+        default=3,
+        ge=0,
+        le=100,
+        description="Number of unchanged context lines in structured diff hunks",
+        examples=[3, 0],
+    )
+    max_files: int = Field(
+        default=200,
+        ge=1,
+        le=1000,
+        description="Maximum number of files to expand in a structured diff",
+        examples=[50, 200],
+    )
+    max_bytes: int = Field(
+        default=5_000_000,
+        ge=1,
+        le=100_000_000,
+        description="Maximum bytes to read per file in a structured diff",
+        examples=[1000000, 5000000],
     )
     max_results: Optional[int] = Field(
         default=10,
@@ -125,10 +155,15 @@ class QueryReviewsParams(PaginatedParams):
             ReviewAction.FILES_READBY,
             ReviewAction.FILES,
             ReviewAction.COMMENTS,
+            ReviewAction.DIFF,
         }
 
         if self.action in required_actions and not self.review_id:
-            raise ValueError(f"review_id is required for action: {self.action.value}")
+            # BaseParams serializes enums to their values, so ``self.action``
+            # can be either a ReviewAction instance or a plain string here.
+            # Avoid masking the useful validation error with AttributeError.
+            action_name = getattr(self.action, "value", self.action)
+            raise ValueError(f"review_id is required for action: {action_name}")
 
         return self
 
@@ -173,6 +208,15 @@ class NotifyMode(str, Enum):
 class CommentContext(BaseParams):
     """Context payload for creating or replying to review comments."""
 
+    # Trailing newlines in ``content`` are part of the Swarm context payload;
+    # do not inherit BaseParams' generic whitespace stripping for this model.
+    model_config = {
+        "str_strip_whitespace": False,
+        "validate_assignment": True,
+        "extra": "forbid",
+        "use_enum_values": True,
+    }
+
     file: Optional[str] = Field(
         default=None,
         description="file mandatory unless attribute or comment are set: File to comment on. " \
@@ -180,24 +224,21 @@ class CommentContext(BaseParams):
         examples=["//depot/path/to/file.txt"]
     )
     leftLine: Optional[int] = Field(
-        default="null",
+        default=None,
         ge=1,
-        description="leftline optional, but if specified, you must also specify the rightline and " \
-        "content parameters. Integer: Left-side diff line number to attach the inline comment to. " \
+        description="Optional left-side diff line number. Deletion comments may use only leftLine. " \
         "Valid only for changes and reviews topics."
     )
     rightLine: Optional[int] = Field(
-        default="null",
+        default=None,
         ge=1,
-        description="rightline optional, but if specified, you must also specify the leftline and " \
-        "content parameters. Integer: Right-side diff line number to attach the inline comment to. " \
+        description="Optional right-side diff line number. Addition comments may use only rightLine. " \
         "Valid only for changes and reviews topics."
     )
-    content: Optional[List[str]] = Field(
-        default="null",
-        description="content optional, but if specified, you must also specify the leftline and rightline " \
-        "parameters. Array of strings: Provide the content of the codeline the comment is on and the four " \
-        "preceding codelines. Always add a newline character ('\n') to the end of each line in the array. ",
+    content: Optional[List[Annotated[str, StringConstraints(strip_whitespace=False)]]] = Field(
+        default=None,
+        description="Optional array of exact Swarm context lines. Preserve trailing newlines; " \
+        "an inline context needs at least one leftLine or rightLine.",
         examples=[["line1\n", "line2\n", "line3\n", "line4\n", "line5\n"]]
     )
     version: Optional[int] = Field(
@@ -230,9 +271,23 @@ class CommentContext(BaseParams):
     @model_validator(mode="after")
     def validate_context_semantics(self):
         """Validate context semantics."""
-        if (self.leftLine is not None or self.rightLine is not None or self.content is not None):
-            if self.leftLine is None or self.rightLine is None or self.content is None:
-                raise ValueError("leftLine, rightLine, and content must all be specified together")
+        # Structured diff records may use one-sided semantic anchors for
+        # additions/deletions, but Swarm's v11 comment endpoint requires both
+        # line numbers when a comment is inline.  Keep that transport contract
+        # strict here; the diff DTO is intentionally a separate, nullable
+        # representation and must not be passed to this model verbatim.
+        has_left = self.leftLine is not None
+        has_right = self.rightLine is not None
+        has_lines = has_left or has_right
+        if self.content is not None and not has_lines:
+            raise ValueError("content requires leftLine or rightLine")
+        if has_lines and not self.file:
+            raise ValueError("file is required for a line context")
+        if has_lines and not (has_left and has_right):
+            raise ValueError(
+                "leftLine and rightLine must both be provided for a Swarm inline context")
+        if self.content is not None and not all(isinstance(line, str) for line in self.content):
+            raise ValueError("content must contain strings")
         return self
 
 class ModifyReviewsParams(BaseParams):
@@ -318,6 +373,14 @@ class ModifyReviewsParams(BaseParams):
         default=None,
         ge=1,
         description="Review version for comment attachment"
+    )
+    # BaseParams enables generic string stripping for ordinary fields.  These
+    # strings are different: Swarm uses the exact source context (including
+    # indentation and trailing newlines) to validate an inline anchor.
+    comment_content: Optional[List[Annotated[str, StringConstraints(strip_whitespace=False)]]] = Field(
+        default=None,
+        description="Code context lines for an inline comment; trailing newlines are preserved",
+        examples=[["line 1\n", "line 2\n"]]
     )
 
     # Vote

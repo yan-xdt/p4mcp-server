@@ -1002,10 +1002,23 @@ The MCP server checks properties in this order. Each property is resolved indepe
 
 - **Actions**:
   - `list` - List shelved changes by user or globally
-  - `diff` - Show differences in shelved files
+  - `diff` - Show differences in shelved files; use `structured=true` for line-addressable hunks
   - `files` - List files in a specific shelf
-- **Parameters**: `changelist_id`, `user`, `max_results`
+- **Parameters**: `changelist_id`, `user`, `structured`, `context_lines`, `max_files`, `max_bytes`, `max_results`
 - **Use cases**: Code review, work-in-progress tracking, collaboration
+
+`diff` keeps the legacy `list[str]` P4 output when `structured=false`. With
+`structured=true`, the response contains one record per file and `hunks` with
+`leftLine`/`rightLine` anchors. Additions and deletions use a nullable
+one-sided anchor; binary files, unknown actions, missing sections, and files
+that exceed a limit are returned with `supported=false`, `complete=false`, and
+an explanatory `reason`. `complete=false` is also set when `max_files` omits
+files (listed in `omittedFiles`). `max_files` and `max_bytes` bound expansion
+and parsing, not the total amount of data the P4 server may read.
+
+For a structured shelf diff, the tagged `describe -S` record must identify the
+requested changelist, have `status=pending`, and contain concrete depot files.
+Submitted changes and an empty/malformed shelf fail closed.
 
 </details>
 
@@ -1030,16 +1043,42 @@ The MCP server checks properties in this order. Each property is resolved indepe
   - `transitions` - Get available state transitions for a review
   - `files_readby` - Get files read status by users
   - `files` - Get files in a review (with optional version range)
+  - `diff` - Return a structured, line-addressable diff for a review version range
   - `activity` - Get review activity history
   - `comments` - Get comments on a review
 - **Parameters**: 
-  - `review_id` - Review ID (required for get, transitions, files_readby, files, comments, activity)
-  - `review_fields` - Comma-separated fields to return (e.g., "id,description,author,state")
+  - `review_id` - Review ID (required for get, transitions, files_readby, files, diff, comments, activity)
+  - `fields` - Fields to return for list/get (for example, `id`, `description`, `author`, `state`)
   - `comments_fields` - Fields for comments (default: "id,body,user,time")
   - `up_voters` - List of up voters for transitions
-  - `from_version`, `to_version` - Version range for files action
+  - `from_version`, `to_version` - Version range for files/diff actions
+  - `structured` - With `files`, switch from metadata-only output to structured hunks
+  - `context_lines`, `max_files`, `max_bytes` - Structured diff context and limits
   - `max_results` - Maximum results (default: 10)
 - **Use cases**: Code review discovery, review status tracking, comment retrieval, review activity monitoring
+
+`files` remains the backwards-compatible metadata response by default. Use
+`structured=true` with `files`, or use `diff` (which is always structured), to receive `files[].hunks` and
+per-line `kind`/`side` records with nullable `leftLine` and `rightLine` values.
+The line `content` is preserved exactly, including indentation and trailing
+newlines. Additions and deletions may therefore have a null semantic side in
+the diff result; that null must not be copied directly into a comment request.
+The Swarm v11 inline-comment payload requires both `leftLine` and `rightLine`
+when a line context is supplied (the MCP model rejects a one-sided request
+locally), while `content` remains optional for a two-sided context. Binary,
+unknown-action, missing-section, and incomplete records are explicit and never
+receive a synthetic line number. The top-level result reports `sourceChange`,
+which is the selected version's changelist.
+
+For the default (latest) pending review diff, the selected source is strictly
+`versions[-1].change`; that version must be known to be pending (the latest
+version's flag is preferred, with the top-level pending flag used only when a
+field-limited response omits it). If both pending flags are present and
+contradict one another, the response fails closed and must be retried with
+fresh metadata. The corresponding P4 shelf must be a matching pending
+changelist with files.
+The implementation never falls back to `changes[0]`. A submitted, missing, or
+ambiguous shelf returns an error instead of an apparently complete diff.
 
 </details>
 
@@ -1166,10 +1205,17 @@ The MCP server checks properties in this order. Each property is resolved indepe
   - `task_state` - Comment task state: `open`, `comment`
   - `notify` - Notification mode: `immediate`, `delayed`
   - `comment_id` - Comment ID for replies or marking read/unread
-  - `context` - Comment context (file, line numbers, content, version)
+  - `comment_file_path`, `comment_left_line`, `comment_right_line`, `comment_content`, `comment_version` - Flat inline context fields; content preserves indentation and trailing newlines
   - `not_updated_since`, `max_reviews` - Filters for archive_inactive
   - `new_author`, `new_description` - Values for update actions
 - **Use cases**: Code review workflow, review state management, collaborative commenting, participant management, review cleanup
+
+For an inline comment, provide a depot file plus both `comment_left_line` and
+`comment_right_line`; the Swarm v11 endpoint rejects a one-sided line context.
+`comment_content` is optional, but when supplied it is sent byte-for-byte as
+the exact source context (including indentation and line endings). A nullable
+side in a structured diff is a semantic add/delete marker, not a valid comment
+payload by itself.
 
 </details>
 

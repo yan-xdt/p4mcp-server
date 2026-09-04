@@ -36,6 +36,31 @@ class QueryShelvesParams(PaginatedParams):
         description="Filter by user - for list action",
         examples=["alice"]
     )
+    structured: bool = Field(
+        default=False,
+        description=(
+            "Return unified hunks with left/right line anchors for diff action; "
+            "false preserves the legacy raw list[str] response"
+        ),
+    )
+    context_lines: int = Field(
+        default=3,
+        ge=0,
+        le=100,
+        description="Requested unchanged context lines for a structured diff",
+    )
+    max_files: int = Field(
+        default=200,
+        ge=1,
+        le=1000,
+        description="Maximum files to expand in a structured shelf diff",
+    )
+    max_bytes: int = Field(
+        default=5_000_000,
+        ge=1,
+        le=100_000_000,
+        description="Maximum parsed bytes per file in a structured shelf diff",
+    )
 
     @model_validator(mode='after')
     def validate_changelist_id_for_actions(self):
