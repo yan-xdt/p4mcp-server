@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import re
@@ -17,6 +18,140 @@ DEFAULT_MAX_TOTAL_BYTES = 10_000_000
 MIN_MAX_TOTAL_BYTES = 65_536
 _MAX_OMITTED_PATHS = 100
 _MAX_ERROR_SUMMARIES = 100
+
+
+class InventoryFingerprintMismatch(ValueError):
+    """The caller's optimistic inventory token no longer matches."""
+
+    def __init__(self, expected: str, actual: str):
+        super().__init__(
+            "expected_inventory_fingerprint does not match the current inventory; "
+            "restart pagination from the first page"
+        )
+        self.expected = expected
+        self.actual = actual
+
+
+def normalize_file_filters(
+        exclude_types: Optional[Sequence[str]] = None,
+        exclude_globs: Optional[Sequence[str]] = None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return deterministic, validated file-filter values.
+
+    P4 file types are case-insensitive while depot paths and glob patterns are
+    kept case-sensitive.  Sorting makes equivalent filter sets produce the
+    same inventory fingerprint regardless of command-line ordering.
+    """
+    if isinstance(exclude_types, (str, bytes)):
+        raise ValueError("exclude_types must be a list of strings")
+    if isinstance(exclude_globs, (str, bytes)):
+        raise ValueError("exclude_globs must be a list of strings")
+    types: set[str] = set()
+    for raw in exclude_types or ():
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("exclude_types entries must be non-empty strings")
+        types.add(raw.strip().lower())
+
+    globs: set[str] = set()
+    for raw in exclude_globs or ():
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("exclude_globs entries must be non-empty strings")
+        globs.add(raw.strip())
+    return tuple(sorted(types)), tuple(sorted(globs))
+
+
+def filter_file_inventory(
+        entries: Sequence[Mapping[str, Any]],
+        exclude_types: Optional[Sequence[str]] = None,
+        exclude_globs: Optional[Sequence[str]] = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Filter metadata before paging or reading any file content.
+
+    The first matching rule owns the exclusion count so the summary remains
+    deterministic and its rule counts always add up to ``excludedFileCount``.
+    ``binary`` intentionally matches P4's ``binary+l`` and ``ubinary`` forms,
+    consistent with the structured diff's binary detection.
+    """
+    types, globs = normalize_file_filters(exclude_types, exclude_globs)
+    selected: list[dict[str, Any]] = []
+    excluded_by_rule: dict[str, int] = {}
+
+    for raw in entries:
+        if not isinstance(raw, Mapping):
+            raise ValueError("file inventory contains a malformed entry")
+        item = dict(raw)
+        path = _file_path(item)
+        if not path:
+            raise ValueError("file inventory contains a file without a depot path")
+        raw_type = str(
+            item.get("type") or item.get("fileType")
+            or item.get("filetype") or ""
+        ).strip().lower()
+        base_type = raw_type.split("+", 1)[0]
+
+        reason: Optional[str] = None
+        for excluded_type in types:
+            matches = (
+                "binary" in base_type if excluded_type == "binary"
+                else base_type == excluded_type
+            )
+            if matches:
+                reason = f"type:{excluded_type}"
+                break
+        if reason is None:
+            for pattern in globs:
+                if fnmatchcase(path, pattern):
+                    reason = f"glob:{pattern}"
+                    break
+
+        if reason is None:
+            selected.append(item)
+        else:
+            excluded_by_rule[reason] = excluded_by_rule.get(reason, 0) + 1
+
+    summary = {
+        "excludeTypes": list(types),
+        "excludeGlobs": list(globs),
+        "inputFileCount": len(entries),
+        "selectedFileCount": len(selected),
+        "excludedFileCount": len(entries) - len(selected),
+        "excludedByRule": excluded_by_rule,
+    }
+    return selected, summary
+
+
+def file_filter_identity(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the filter portion that must participate in a fingerprint."""
+    if not summary.get("excludeTypes") and not summary.get("excludeGlobs"):
+        return {}
+    return {
+        "excludeTypes": list(summary.get("excludeTypes") or []),
+        "excludeGlobs": list(summary.get("excludeGlobs") or []),
+    }
+
+
+def normalize_expected_fingerprint(expected: Optional[str]) -> Optional[str]:
+    """Validate and normalize an optional SHA-256 continuation token."""
+    if expected is None:
+        return None
+    normalized = expected.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise ValueError(
+            "expected_inventory_fingerprint must be a 64-character SHA-256 hex string"
+        )
+    return normalized
+
+
+def validate_expected_fingerprint(
+        actual: str,
+        expected: Optional[str],
+    ) -> None:
+    """Fail closed when a caller continues against a different inventory."""
+    normalized = normalize_expected_fingerprint(expected)
+    if normalized is None:
+        return
+    if normalized != actual:
+        raise InventoryFingerprintMismatch(normalized, actual)
 
 
 def json_size(value: Any) -> int:
@@ -110,6 +245,74 @@ def prepare_diff_page(
         after_file=after_file,
         inventory_fingerprint=fingerprint,
     )
+
+
+def finish_metadata_page(
+        plan: DiffPagePlan,
+        max_total_bytes: int,
+        base: Optional[Mapping[str, Any]] = None,
+        *,
+        metadata_limited: bool = False,
+    ) -> dict[str, Any]:
+    """Build an exactly budgeted metadata-only page.
+
+    Unlike ``StructuredDiffPage``, metadata entries have no supported/complete
+    content flags.  This helper still applies the same exclusive cursor,
+    fingerprint, and hard JSON-size contract without pretending that metadata
+    has been content-reviewed.
+    """
+    if max_total_bytes < MIN_MAX_TOTAL_BYTES:
+        raise ValueError(
+            f"max_total_bytes must be at least {MIN_MAX_TOTAL_BYTES}"
+        )
+
+    files: list[dict[str, Any]] = []
+
+    def render() -> dict[str, Any]:
+        end = plan.start_index + len(files)
+        has_more = end < len(plan.entries)
+        result = dict(base or {})
+        warnings = list(result.get("warnings") or [])
+        if metadata_limited:
+            warnings.append(
+                "The source file metadata was limited; the inventory is incomplete."
+            )
+            result["limited"] = True
+        result.update({
+            "files": list(files),
+            "afterFile": plan.after_file,
+            "lastSeen": _file_path(files[-1]) if files else None,
+            "hasMore": has_more,
+            "totalFiles": len(plan.entries),
+            "returnedFiles": len(files),
+            "omittedFileCount": len(plan.entries) - end,
+            "inventoryFingerprint": plan.inventory_fingerprint,
+            "maxFiles": plan.max_files,
+            "maxTotalBytes": max_total_bytes,
+            "complete": not has_more and not metadata_limited,
+            "warnings": list(dict.fromkeys(warnings)),
+            "payloadBytes": 0,
+        })
+        # A few iterations converge because only the digit count can change.
+        for _ in range(4):
+            result["payloadBytes"] = json_size(result)
+        return result
+
+    for candidate in plan.candidates:
+        files.append(dict(candidate))
+        if json_size(render()) > max_total_bytes:
+            files.pop()
+            break
+
+    if plan.candidates and not files:
+        raise ValueError(
+            "max_total_bytes is too small to return one metadata file record"
+        )
+
+    result = render()
+    if json_size(result) > max_total_bytes:
+        raise ValueError("metadata page exceeds max_total_bytes")
+    return result
 
 
 def _compact_for_page_budget(item: Mapping[str, Any], max_total_bytes: int) -> dict[str, Any]:

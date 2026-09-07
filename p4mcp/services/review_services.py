@@ -56,10 +56,17 @@ from ..core.connection import P4ConnectionManager
 from ..models.review_models import CommentContext
 from .structured_diff import (
     DEFAULT_MAX_TOTAL_BYTES,
+    InventoryFingerprintMismatch,
     MIN_MAX_TOTAL_BYTES,
     StructuredDiffPage,
     build_structured_file,
+    file_filter_identity,
+    filter_file_inventory,
+    finish_metadata_page,
+    normalize_expected_fingerprint,
+    normalize_file_filters,
     prepare_diff_page,
+    validate_expected_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -505,11 +512,35 @@ class ReviewServices:
             self,
             review_id: int,
             from_version: Optional[int] = None,
-            to_version: Optional[int] = None
+            to_version: Optional[int] = None,
+            max_files: Optional[int] = None,
+            after_file: Optional[str] = None,
+            max_total_bytes: Optional[int] = None,
+            exclude_types: Optional[List[str]] = None,
+            exclude_globs: Optional[List[str]] = None,
+            expected_inventory_fingerprint: Optional[str] = None,
         ) -> Dict[str, Any]:
         """GET /api/v11/reviews/{id}/files?from={x}&to={y}
-        Get list of files that changed between specified versions of a review.
+        Get files changed between review versions.
+
+        With ``max_files`` (as used by the public handler), the lightweight
+        Swarm inventory is normalized, filtered, sorted, cursor-paged, and
+        size-bounded locally. Calls without paging/filter arguments retain the
+        historical raw Swarm envelope for internal compatibility.
         """
+        try:
+            normalized_exclude_types, normalized_exclude_globs = (
+                normalize_file_filters(exclude_types, exclude_globs)
+            )
+        except ValueError as exc:
+            return self._diff_error(
+                review_id, exc, stage="file-filter", retryable=False)
+        try:
+            expected_fingerprint = normalize_expected_fingerprint(
+                expected_inventory_fingerprint)
+        except ValueError as exc:
+            return self._diff_error(
+                review_id, exc, stage="file-pagination", retryable=False)
         try:
             auth = await self._get_auth()
             api_base = await self._get_api_base()
@@ -522,7 +553,94 @@ class ReviewServices:
                 params["to"] = to_version
 
             r = requests.get(url, auth=auth, params=params if params else None, verify=self.verify_ssl)
-            return {"status": "success", "message": self._handle_response(r)}
+            payload = self._handle_response(r)
+
+            advanced = any((
+                max_files is not None,
+                after_file is not None,
+                max_total_bytes is not None,
+                bool(exclude_types),
+                bool(exclude_globs),
+                expected_inventory_fingerprint is not None,
+            ))
+            if not advanced:
+                return {"status": "success", "message": payload}
+
+            effective_max_files = 200 if max_files is None else max_files
+            effective_max_total_bytes = (
+                DEFAULT_MAX_TOTAL_BYTES
+                if max_total_bytes is None else max_total_bytes
+            )
+            if effective_max_files < 1:
+                return {"status": "error", "message": "max_files must be positive"}
+            if effective_max_total_bytes < MIN_MAX_TOTAL_BYTES:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"max_total_bytes must be at least {MIN_MAX_TOTAL_BYTES}"
+                    ),
+                }
+
+            entries, metadata_limited = _review_files_payload(payload)
+            selected, filter_summary = filter_file_inventory(
+                entries,
+                normalized_exclude_types,
+                normalized_exclude_globs,
+            )
+            identity = {
+                "kind": "review-files",
+                "reviewId": review_id,
+                "fromVersion": from_version,
+                "toVersion": to_version,
+                **file_filter_identity(filter_summary),
+            }
+            plan = prepare_diff_page(
+                selected,
+                effective_max_files,
+                after_file,
+                inventory_identity=identity,
+            )
+            try:
+                validate_expected_fingerprint(
+                    plan.inventory_fingerprint,
+                    expected_fingerprint,
+                )
+            except (InventoryFingerprintMismatch, ValueError) as exc:
+                mismatch = isinstance(exc, InventoryFingerprintMismatch)
+                return self._diff_error(
+                    review_id,
+                    exc,
+                    stage="file-pagination",
+                    expectedInventoryFingerprint=expected_fingerprint,
+                    inventoryFingerprint=plan.inventory_fingerprint,
+                    restartRequired=mismatch,
+                    retryable=False,
+                )
+
+            base = {
+                "reviewId": review_id,
+                "fromVersion": from_version,
+                "toVersion": to_version,
+                "source": "swarm-review-files",
+                "fileFilters": filter_summary,
+                "warnings": [],
+            }
+            result = finish_metadata_page(
+                plan,
+                effective_max_total_bytes,
+                base,
+                metadata_limited=metadata_limited,
+            )
+            return {"status": "success", "message": result}
+        except ValueError as exc:
+            stage = "file-pagination" if "pagination" in str(exc) else "review-files"
+            return self._diff_error(
+                review_id,
+                exc,
+                stage=stage,
+                restartRequired=stage == "file-pagination",
+                retryable=stage != "file-pagination",
+            )
         except Exception as e:
             logger.error(f"Failed to get review files for '{review_id}': {e}")
             return {"status": "error", "message": str(e)}
@@ -625,6 +743,9 @@ class ReviewServices:
             max_bytes: int = 5_000_000,
             after_file: Optional[str] = None,
             max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+            exclude_types: Optional[List[str]] = None,
+            exclude_globs: Optional[List[str]] = None,
+            expected_inventory_fingerprint: Optional[str] = None,
         ) -> Dict[str, Any]:
         """Return a bounded, line-addressable page for a review version range.
 
@@ -645,7 +766,21 @@ class ReviewServices:
                 "status": "error",
                 "message": f"max_total_bytes must be at least {MIN_MAX_TOTAL_BYTES}",
             }
-
+        try:
+            # Validate once before any network or P4 work. The normalized
+            # values are also used for deterministic filter identity below.
+            normalized_exclude_types, normalized_exclude_globs = (
+                normalize_file_filters(exclude_types, exclude_globs)
+            )
+        except ValueError as exc:
+            return self._diff_error(
+                review_id, exc, stage="file-filter", retryable=False)
+        try:
+            expected_fingerprint = normalize_expected_fingerprint(
+                expected_inventory_fingerprint)
+        except ValueError as exc:
+            return self._diff_error(
+                review_id, exc, stage="file-pagination", retryable=False)
         info_result = await self.get_review_info(
             review_id, fields=["id", "versions", "pending", "state"])
         if not isinstance(info_result, Mapping):
@@ -782,8 +917,13 @@ class ReviewServices:
                 # never transfers the complete shelf before max_files applies.
                 async with self.connection_manager.get_connection() as p4:
                     entries = self._p4_describe_shelf(p4, to_change)
-                    plan = prepare_diff_page(
+                    selected_entries, filter_summary = filter_file_inventory(
                         entries,
+                        normalized_exclude_types,
+                        normalized_exclude_globs,
+                    )
+                    plan = prepare_diff_page(
+                        selected_entries,
                         max_files,
                         after_file,
                         inventory_identity={
@@ -794,8 +934,29 @@ class ReviewServices:
                             "fromChange": from_change,
                             "toChange": to_change,
                             "pending": target_pending,
+                            **file_filter_identity(filter_summary),
                         },
                     )
+                    try:
+                        validate_expected_fingerprint(
+                            plan.inventory_fingerprint,
+                            expected_fingerprint,
+                        )
+                    except (InventoryFingerprintMismatch, ValueError) as exc:
+                        mismatch = isinstance(exc, InventoryFingerprintMismatch)
+                        return self._diff_error(
+                            review_id,
+                            exc,
+                            stage="file-pagination",
+                            sourceChange=to_change,
+                            fromVersion=effective_from,
+                            toVersion=effective_to,
+                            expectedInventoryFingerprint=(
+                                expected_fingerprint),
+                            inventoryFingerprint=plan.inventory_fingerprint,
+                            restartRequired=mismatch,
+                            retryable=False,
+                        )
                     page = StructuredDiffPage(plan, max_total_bytes)
                     for entry in plan.candidates:
                         item = await build_structured_file(
@@ -844,8 +1005,13 @@ class ReviewServices:
                         complete=False,
                         retryable=True,
                     )
-                plan = prepare_diff_page(
+                selected_entries, filter_summary = filter_file_inventory(
                     entries,
+                    normalized_exclude_types,
+                    normalized_exclude_globs,
+                )
+                plan = prepare_diff_page(
+                    selected_entries,
                     max_files,
                     after_file,
                     inventory_identity={
@@ -856,8 +1022,28 @@ class ReviewServices:
                         "fromChange": from_change,
                         "toChange": to_change,
                         "pending": target_pending,
+                        **file_filter_identity(filter_summary),
                     },
                 )
+                try:
+                    validate_expected_fingerprint(
+                        plan.inventory_fingerprint,
+                        expected_fingerprint,
+                    )
+                except (InventoryFingerprintMismatch, ValueError) as exc:
+                    mismatch = isinstance(exc, InventoryFingerprintMismatch)
+                    return self._diff_error(
+                        review_id,
+                        exc,
+                        stage="file-pagination",
+                        sourceChange=to_change,
+                        fromVersion=effective_from,
+                        toVersion=effective_to,
+                        expectedInventoryFingerprint=expected_fingerprint,
+                        inventoryFingerprint=plan.inventory_fingerprint,
+                        restartRequired=mismatch,
+                        retryable=False,
+                    )
                 page = StructuredDiffPage(plan, max_total_bytes)
                 async with self.connection_manager.get_connection() as p4:
                     if target_pending:
@@ -912,6 +1098,7 @@ class ReviewServices:
             "maxFiles": max_files,
             "maxBytes": max_bytes,
             "source": source,
+            "fileFilters": filter_summary,
             "warnings": [],
         }
         try:
@@ -950,15 +1137,17 @@ class ReviewServices:
             return {"status": "error", "message": str(e)}
         
     async def get_review_comments(
-            self, 
-            review_id: int
+            self,
+            review_id: int,
+            fields: Optional[str] = None,
         ) -> Dict[str, Any]:
         """GET /api/v11/reviews/{id}/comments - Get a list of comments on a review"""
         try:
             auth = await self._get_auth()
             api_base = await self._get_api_base()
             url = f"{api_base}/reviews/{review_id}/comments"
-            r = requests.get(url, auth=auth, verify=self.verify_ssl)
+            params = {"fields": fields} if fields else None
+            r = requests.get(url, auth=auth, params=params, verify=self.verify_ssl)
             return {"status": "success", "message": self._handle_response(r)}
         except Exception as e:
             logger.error(f"Failed to get comments for review '{review_id}': {e}")

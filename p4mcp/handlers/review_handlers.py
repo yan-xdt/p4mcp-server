@@ -65,32 +65,46 @@ class ReviewsHandlers:
             if getattr(params, "structured", False):
                 result = await self.review_services.get_review_diff(
                     params.review_id,
-                    getattr(params, "from_version", None),
-                    getattr(params, "to_version", None),
-                    getattr(params, "context_lines", 3),
-                    getattr(params, "max_files", 200),
-                    getattr(params, "max_bytes", 5_000_000),
-                    getattr(params, "after_file", None),
-                    getattr(params, "max_total_bytes", 10_000_000),
+                    from_version=getattr(params, "from_version", None),
+                    to_version=getattr(params, "to_version", None),
+                    context_lines=getattr(params, "context_lines", 3),
+                    max_files=getattr(params, "max_files", 200),
+                    max_bytes=getattr(params, "max_bytes", 5_000_000),
+                    after_file=getattr(params, "after_file", None),
+                    max_total_bytes=getattr(params, "max_total_bytes", 10_000_000),
+                    exclude_types=getattr(params, "exclude_types", None),
+                    exclude_globs=getattr(params, "exclude_globs", None),
+                    expected_inventory_fingerprint=getattr(
+                        params, "expected_inventory_fingerprint", None),
                 )
             else:
-                # get_review_files(review_id, from_version, to_version)
                 result = await self.review_services.get_review_files(
                     params.review_id,
-                    getattr(params, "from_version", None),
-                    getattr(params, "to_version", None)
+                    from_version=getattr(params, "from_version", None),
+                    to_version=getattr(params, "to_version", None),
+                    max_files=getattr(params, "max_files", 200),
+                    after_file=getattr(params, "after_file", None),
+                    max_total_bytes=getattr(params, "max_total_bytes", 10_000_000),
+                    exclude_types=getattr(params, "exclude_types", None),
+                    exclude_globs=getattr(params, "exclude_globs", None),
+                    expected_inventory_fingerprint=getattr(
+                        params, "expected_inventory_fingerprint", None),
                 )
 
         elif params.action == "diff":
             result = await self.review_services.get_review_diff(
                 params.review_id,
-                getattr(params, "from_version", None),
-                getattr(params, "to_version", None),
-                getattr(params, "context_lines", 3),
-                getattr(params, "max_files", 200),
-                getattr(params, "max_bytes", 5_000_000),
-                getattr(params, "after_file", None),
-                getattr(params, "max_total_bytes", 10_000_000),
+                from_version=getattr(params, "from_version", None),
+                to_version=getattr(params, "to_version", None),
+                context_lines=getattr(params, "context_lines", 3),
+                max_files=getattr(params, "max_files", 200),
+                max_bytes=getattr(params, "max_bytes", 5_000_000),
+                after_file=getattr(params, "after_file", None),
+                max_total_bytes=getattr(params, "max_total_bytes", 10_000_000),
+                exclude_types=getattr(params, "exclude_types", None),
+                exclude_globs=getattr(params, "exclude_globs", None),
+                expected_inventory_fingerprint=getattr(
+                    params, "expected_inventory_fingerprint", None),
             )
 
         elif params.action == "activity":
@@ -103,7 +117,8 @@ class ReviewsHandlers:
         elif params.action == "comments":
             # get_review_comments(review_id)
             result = await self.review_services.get_review_comments(
-                params.review_id
+                params.review_id,
+                getattr(params, "comments_fields", None),
             )
 
         else:

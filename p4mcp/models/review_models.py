@@ -92,7 +92,7 @@ class QueryReviewsParams(PaginatedParams):
         default=200,
         ge=1,
         le=1000,
-        description="Maximum files in one structured-diff page; applied before content is read",
+        description="Maximum files in one metadata/diff page; applied before content is read",
         examples=[50, 200],
     )
     max_bytes: int = Field(
@@ -105,7 +105,7 @@ class QueryReviewsParams(PaginatedParams):
     after_file: Optional[str] = Field(
         default=None,
         description=(
-            "Exclusive structured-diff file cursor. Pass the exact lastSeen "
+            "Exclusive file-page cursor. Pass the exact lastSeen "
             "depot path from the preceding page."
         ),
         examples=["//depot/project/file.cpp"],
@@ -114,8 +114,32 @@ class QueryReviewsParams(PaginatedParams):
         default=10_000_000,
         ge=65_536,
         le=100_000_000,
-        description="Hard UTF-8 JSON byte budget for one structured-diff payload",
+        description="Hard UTF-8 JSON byte budget for one file metadata/diff page",
         examples=[1000000, 10000000],
+    )
+    exclude_types: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "P4 file types to exclude before file paging and content reads; "
+            "'binary' also matches binary modifiers/forms"
+        ),
+        examples=[["binary"]],
+    )
+    exclude_globs: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Case-sensitive depot-path globs to exclude before file paging "
+            "and content reads"
+        ),
+        examples=[["**/*.meta", "**/*.prefab"]],
+    )
+    expected_inventory_fingerprint: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description=(
+            "Expected SHA-256 inventory fingerprint from the first page; "
+            "a mismatch fails closed and requires restarting pagination"
+        ),
     )
     max_results: Optional[int] = Field(
         default=10,

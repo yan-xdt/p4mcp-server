@@ -294,6 +294,176 @@ def test_pending_diff_pages_inventory_before_reading_content():
     assert [call[0] for call in p4.calls] == ["diff2"]
 
 
+def test_pending_diff_filters_before_paging_and_content_reads():
+    p4 = _FakeP4()
+    p4.run_describe = lambda *args: [{
+        "change": "200",
+        "status": "pending",
+        "depotFile": [
+            "//depot/asset.bin", "//depot/code.cs", "//depot/code.cs.meta",
+        ],
+        "action": ["edit", "edit", "edit"],
+        "type": ["binary+l", "text", "text"],
+        "rev": ["1", "7", "1"],
+    }]
+    service = ReviewServices(_Connection(p4))
+
+    async def review_info(review_id, fields=None):
+        return {"status": "success", "message": {"data": {"reviews": [{
+            "id": review_id,
+            "pending": True,
+            "versions": [{"change": "200", "pending": True}],
+        }]}}}
+
+    service.get_review_info = review_info
+    result = asyncio.run(service.get_review_diff(
+        100,
+        max_files=10,
+        exclude_types=["binary"],
+        exclude_globs=["**/*.meta"],
+    ))
+
+    assert result["status"] == "success"
+    assert [item["depotFile"] for item in result["message"]["files"]] == [
+        "//depot/code.cs"
+    ]
+    assert result["message"]["fileFilters"] == {
+        "excludeTypes": ["binary"],
+        "excludeGlobs": ["**/*.meta"],
+        "inputFileCount": 3,
+        "selectedFileCount": 1,
+        "excludedFileCount": 2,
+        "excludedByRule": {"type:binary": 1, "glob:**/*.meta": 1},
+    }
+    assert [call[0] for call in p4.calls] == ["diff2"]
+
+    p4.calls.clear()
+    empty = asyncio.run(service.get_review_diff(
+        100, max_files=10, exclude_globs=["**/*"]))
+    assert empty["status"] == "success"
+    assert empty["message"]["files"] == []
+    assert empty["message"]["complete"] is True
+    assert empty["message"]["fileFilters"]["excludedFileCount"] == 3
+    assert p4.calls == []
+
+
+def test_pending_diff_expected_fingerprint_fails_before_content_read():
+    p4 = _FakeP4()
+    service = ReviewServices(_Connection(p4))
+
+    async def review_info(review_id, fields=None):
+        return {"status": "success", "message": {"data": {"reviews": [{
+            "id": review_id,
+            "pending": True,
+            "versions": [{"change": "200", "pending": True}],
+        }]}}}
+
+    service.get_review_info = review_info
+    first = asyncio.run(service.get_review_diff(100, max_files=1))
+    expected = first["message"]["inventoryFingerprint"]
+    p4.calls.clear()
+    p4.run_describe = lambda *args: [{
+        "change": "200",
+        "status": "pending",
+        "depotFile": ["//depot/a.txt"],
+        "action": ["edit"],
+        "type": ["text"],
+        "rev": ["8"],
+    }]
+
+    changed = asyncio.run(service.get_review_diff(
+        100, max_files=1, expected_inventory_fingerprint=expected))
+
+    assert changed["status"] == "error"
+    assert changed["message"]["stage"] == "file-pagination"
+    assert changed["message"]["restartRequired"] is True
+    assert changed["message"]["inventoryFingerprint"] != expected
+    assert p4.calls == []
+
+
+def test_review_file_metadata_is_filtered_and_cursor_paged(monkeypatch):
+    service = ReviewServices(_Connection(_FakeP4()))
+
+    async def auth():
+        return "auth"
+
+    async def api_base():
+        return "https://swarm.example/api/v11"
+
+    service._get_auth = auth
+    service._get_api_base = api_base
+
+    class Response:
+        ok = True
+        text = ""
+
+        def json(self):
+            return {"data": {"files": [
+                {"depotFile": "//depot/c.cs", "type": "text"},
+                {"depotFile": "//depot/a.meta", "type": "text"},
+                {"depotFile": "//depot/b.cs", "type": "text"},
+            ]}}
+
+    monkeypatch.setattr(
+        "p4mcp.services.review_services.requests.get",
+        lambda *args, **kwargs: Response(),
+    )
+    first = asyncio.run(service.get_review_files(
+        100, max_files=1, exclude_globs=["**/*.meta"]))
+    fingerprint = first["message"]["inventoryFingerprint"]
+    second = asyncio.run(service.get_review_files(
+        100,
+        max_files=1,
+        after_file="//depot/b.cs",
+        exclude_globs=["**/*.meta"],
+        expected_inventory_fingerprint=fingerprint,
+    ))
+
+    assert [item["depotFile"] for item in first["message"]["files"]] == [
+        "//depot/b.cs"
+    ]
+    assert first["message"]["hasMore"] is True
+    assert first["message"]["fileFilters"]["excludedFileCount"] == 1
+    assert [item["depotFile"] for item in second["message"]["files"]] == [
+        "//depot/c.cs"
+    ]
+    assert second["message"]["hasMore"] is False
+    assert second["message"]["inventoryFingerprint"] == fingerprint
+
+
+def test_review_comments_forwards_requested_fields(monkeypatch):
+    service = ReviewServices(_Connection(_FakeP4()))
+
+    async def auth():
+        return "auth"
+
+    async def api_base():
+        return "https://swarm.example/api/v11"
+
+    service._get_auth = auth
+    service._get_api_base = api_base
+    calls = []
+
+    class Response:
+        ok = True
+        text = ""
+
+        def json(self):
+            return {"data": {"comments": []}}
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return Response()
+
+    monkeypatch.setattr("p4mcp.services.review_services.requests.get", get)
+    result = asyncio.run(service.get_review_comments(100, "id,user"))
+
+    assert result["status"] == "success"
+    assert calls == [(
+        "https://swarm.example/api/v11/reviews/100/comments",
+        {"fields": "id,user"},
+    )]
+
 def test_get_review_info_uses_independent_transitions_endpoint(monkeypatch):
     service = ReviewServices(_Connection(_FakeP4()))
 
