@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -79,12 +80,15 @@ class _FakeP4:
         self.errors = []
         self.metadata = metadata
         self.diff = diff
+        self.calls = []
 
     def run_describe(self, *args):
+        self.calls.append(("describe", *args))
         return self.metadata
 
     def run(self, *args):
-        if args and args[0] == "describe":
+        self.calls.append(args)
+        if args and args[0] == "diff2":
             return self.diff
         raise AssertionError(f"unexpected P4 command: {args}")
 
@@ -143,3 +147,83 @@ def test_get_shelve_files_wraps_suppressed_p4_diagnostics():
     assert result["status"] == "error"
     assert "shelf lookup failed" in str(result["message"])
     assert p4.tagged is True
+
+
+def test_structured_shelf_diff_pages_before_content_reads():
+    metadata = [_record(
+        depotFile=["//depot/c.txt", "//depot/a.txt", "//depot/b.txt"],
+        action=["edit", "edit", "edit"],
+        type=["text", "text", "text"],
+        rev=["7", "7", "7"],
+    )]
+    p4 = _FakeP4(metadata, (
+        "==== //depot/a.txt#7 (text) - //depot/a.txt@=123 (text) ====\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    ))
+    service = ShelveServices(_Connection(p4))
+
+    first = asyncio.run(service.get_shelve_diff(
+        "123", structured=True, max_files=1))
+    assert first["status"] == "success"
+    assert [item["depotFile"] for item in first["message"]["files"]] == [
+        "//depot/a.txt"
+    ]
+    assert first["message"]["hasMore"] is True
+    assert first["message"]["lastSeen"] == "//depot/a.txt"
+    assert p4.calls[0] == ("describe", "-s", "-S", "123")
+    assert len([call for call in p4.calls if call[0] == "diff2"]) == 1
+    assert not any(call[0] == "describe" and "-du3" in call for call in p4.calls)
+
+    p4.calls.clear()
+    second = asyncio.run(service.get_shelve_diff(
+        "123", structured=True, max_files=1,
+        after_file="//depot/a.txt"))
+    assert [item["depotFile"] for item in second["message"]["files"]] == [
+        "//depot/b.txt"
+    ]
+
+
+def test_structured_shelf_diff_rejects_stale_file_cursor():
+    service = ShelveServices(_Connection(_FakeP4([_record()], "")))
+    result = asyncio.run(service.get_shelve_diff(
+        "123", structured=True, after_file="//depot/missing.txt"))
+
+    assert result["status"] == "error"
+    assert result["message"]["stage"] == "file-pagination"
+    assert result["message"]["restartRequired"] is True
+
+
+def test_structured_shelf_diff_clears_oversized_file_hunks():
+    diff = (
+        "==== //depot/a.txt#7 (text) - //depot/a.txt@=123 (text) ====\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+    service = ShelveServices(_Connection(_FakeP4([_record()], diff)))
+    result = asyncio.run(service.get_shelve_diff(
+        "123", structured=True, max_bytes=1))
+
+    assert result["status"] == "success"
+    item = result["message"]["files"][0]
+    assert item["supported"] is False
+    assert item["hunks"] == []
+    assert result["message"]["payloadBytes"] <= 10_000_000
+
+
+def test_structured_shelf_diff_obeys_total_json_budget():
+    body = "x" * 80_000
+    diff = (
+        "==== //depot/a.txt#7 (text) - //depot/a.txt@=123 (text) ====\n"
+        f"@@ -1,1 +1,1 @@\n-old\n+{body}\n"
+    )
+    service = ShelveServices(_Connection(_FakeP4([_record()], diff)))
+    result = asyncio.run(service.get_shelve_diff(
+        "123", structured=True, max_bytes=200_000,
+        max_total_bytes=65_536))
+
+    assert result["status"] == "success"
+    payload = result["message"]
+    assert len(json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), default=str,
+    ).encode("utf-8")) <= 65_536
+    assert payload["files"][0]["hunks"] == []
+    assert payload["lastSeen"] == "//depot/a.txt"

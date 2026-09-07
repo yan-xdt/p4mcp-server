@@ -13,10 +13,10 @@ Use the `query_reviews` and `modify_reviews` tools to manage P4 Code Review code
 |--------|---------|----------------|
 | `list` | List reviews with filters | `fields`, `max_results` |
 | `dashboard` | Get review dashboard for current user | — |
-| `get` | Get full review details | `review_id` |
+| `get` | Get full review details; optionally merge the dedicated transitions response | `review_id`, `include_transitions` |
 | `transitions` | Get available state transitions | `review_id` |
-| `files` | List files in a review (metadata by default; set `structured=true` for hunks) | `review_id`, `from_version`, `to_version`, `structured` |
-| `diff` | Return structured, line-addressable hunks for a review version range | `review_id`, `from_version`, `to_version`, `context_lines` |
+| `files` | List files in a review (metadata by default; set `structured=true` for bounded, paged hunks) | `review_id`, `from_version`, `to_version`, `structured`, `after_file`, `max_total_bytes` |
+| `diff` | Return bounded, paged, line-addressable hunks for a review version range | `review_id`, `from_version`, `to_version`, `context_lines`, `after_file`, `max_total_bytes` |
 | `files_readby` | Check which files have been read by reviewers | `review_id` |
 | `comments` | Get all comments on a review | `review_id` |
 | `activity` | Get review activity log | `review_id` |
@@ -98,6 +98,10 @@ Use the `query_reviews` and `modify_reviews` tools to manage P4 Code Review code
 ## Best Practices
 
 - Check `transitions` before calling `transition` to verify the target state is valid.
+- When a full review and its transitions are needed together, use `get` with
+  `include_transitions=true`. The service reads the dedicated Swarm
+  `/reviews/{id}/transitions` endpoint and fails the whole query if that
+  endpoint is unavailable; do not treat missing transitions as an empty set.
 - Use `files_readby` to track which reviewers have seen the latest changes.
 - Always `shelve` changes before creating a review so reviewers can see the diff.
 - Use `append_participants` rather than `replace_participants` to avoid removing existing reviewers.
@@ -107,3 +111,20 @@ Use the `query_reviews` and `modify_reviews` tools to manage P4 Code Review code
 - Structured diff lines may have a nullable semantic side for additions or
   deletions. Swarm v11 inline comments still require both `leftLine` and
   `rightLine` when a line context is supplied; do not POST a nullable side.
+- `max_files` is a page size and is applied before any file content is read;
+  `max_bytes` limits one file and `max_total_bytes` is the hard compact UTF-8
+  JSON budget for one page. Binary, oversized, undecodable, or otherwise
+  unsupported files remain visible with `supported=false`, `complete=false`,
+  and no partial hunks.
+- Continue structured-diff pagination while `hasMore=true`, passing the exact
+  `lastSeen` depot path back as `after_file`. Compare `inventoryFingerprint`
+  across every page. If it changes, discard the in-progress scan and restart
+  from the first page; a missing/stale cursor fails closed with
+  `restartRequired=true`.
+- `pageComplete` describes only the returned page. Treat the whole diff as
+  complete only when the final page has `complete=true` and `hasMore=false`.
+- For an inline finding, choose a real context line in the same hunk that has
+  both `leftLine` and `rightLine`. If no such anchor exists (for example a
+  pure add/delete with no shared context), post a non-inline review comment or
+  hand it to a human; never invent the missing side or copy the other side's
+  line number.

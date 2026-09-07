@@ -54,15 +54,15 @@ from requests.auth import HTTPBasicAuth
 
 from ..core.connection import P4ConnectionManager
 from ..models.review_models import CommentContext
-from .review_diff import build_hunks, change_kind, looks_binary, parse_unified_diff
+from .structured_diff import (
+    DEFAULT_MAX_TOTAL_BYTES,
+    MIN_MAX_TOTAL_BYTES,
+    StructuredDiffPage,
+    build_structured_file,
+    prepare_diff_page,
+)
 
 logger = logging.getLogger(__name__)
-
-# A unified diff is an intermediate P4 response, not the final MCP payload.
-# Bound it before parsing so a pathological shelf cannot consume unbounded
-# memory even when the caller's per-file limit is small.
-_MAX_STRUCTURED_DIFF_OUTPUT_BYTES = 64 * 1024 * 1024
-
 
 def _payload_data(payload: Any) -> Any:
     """Return the innermost data member of a Swarm envelope, if present."""
@@ -90,8 +90,7 @@ def _review_from_payload(payload: Any) -> Optional[Dict[str, Any]]:
     for _ in range(6):
         if isinstance(value, Mapping):
             # Check direct review objects before looking through envelopes.
-            if value.get("id") is not None and (
-                    "versions" in value or "changes" in value):
+            if value.get("id") is not None:
                 return dict(value)
             found = []
             for key in ("reviews", "review"):
@@ -124,26 +123,75 @@ def _review_from_payload(payload: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _review_reference(payload: Any) -> Optional[dict[str, Any]]:
+    """Locate the mutable review object inside a successful Swarm payload."""
+    value = payload
+    for _ in range(6):
+        if isinstance(value, dict):
+            if value.get("id") is not None:
+                return value
+            candidates: list[dict[str, Any]] = []
+            for key in ("reviews", "review"):
+                candidate = value.get(key)
+                if isinstance(candidate, list):
+                    if len(candidate) != 1 or not isinstance(candidate[0], dict):
+                        return None
+                    candidates.append(candidate[0])
+                elif isinstance(candidate, dict):
+                    candidates.append(candidate)
+                elif candidate is not None:
+                    return None
+            if candidates:
+                return candidates[0] if len(candidates) == 1 else None
+            nested = value.get("data")
+            if isinstance(nested, (dict, list)):
+                value = nested
+                continue
+            return None
+        if isinstance(value, list):
+            if len(value) != 1 or not isinstance(value[0], dict):
+                return None
+            value = value[0]
+            continue
+        return None
+    return None
+
+
+def _transition_fields(payload: Any) -> dict[str, Any]:
+    """Extract the independent transitions endpoint's documented fields."""
+    value = _payload_data(payload)
+    if not isinstance(value, Mapping) or "transitions" not in value:
+        raise ValueError("Swarm transitions response did not contain transitions")
+    transitions = value.get("transitions")
+    if not isinstance(transitions, Mapping):
+        raise ValueError("Swarm transitions response contained malformed transitions")
+    result = {"transitions": dict(transitions)}
+    if "blocked" in value:
+        blocked = value.get("blocked")
+        if not isinstance(blocked, list):
+            raise ValueError("Swarm transitions response contained malformed blocked data")
+        result["blocked"] = list(blocked)
+    return result
+
+
 def _review_files_payload(payload: Any) -> tuple[list[dict[str, Any]], bool]:
     """Extract review file metadata and the Swarm ``limited`` indicator."""
     # Keep an outer ``limited`` flag as well as the normal data.limited form;
     # reverse proxies have emitted both shapes.
     outer_limited = False
-    if isinstance(payload, Mapping):
-        raw_limited = payload.get("limited")
-        if isinstance(raw_limited, bool):
-            outer_limited = raw_limited
-        elif isinstance(raw_limited, str):
-            outer_limited = raw_limited.strip().lower() in {"1", "true", "yes"}
+    if isinstance(payload, Mapping) and "limited" in payload:
+        outer_limited_value = _as_bool(payload.get("limited"))
+        if outer_limited_value is None:
+            raise ValueError("Swarm response contained an invalid outer limited flag")
+        outer_limited = outer_limited_value
     data = _payload_data(payload)
     limited = False
     if isinstance(data, Mapping):
         if "limited" in data:
-            limited_value = data.get("limited")
-            if isinstance(limited_value, bool):
-                limited = limited_value
-            elif isinstance(limited_value, str):
-                limited = limited_value.strip().lower() in {"1", "true", "yes"}
+            limited_value = _as_bool(data.get("limited"))
+            if limited_value is None:
+                raise ValueError("Swarm response contained an invalid limited flag")
+            limited = limited_value
         if "files" not in data:
             raise ValueError("Swarm response did not contain a files list")
         data = data["files"]
@@ -156,22 +204,6 @@ def _review_file_entries(payload: Any) -> List[Dict[str, Any]]:
     """Extract a well-formed review file list or raise on malformed data."""
     entries, _limited = _review_files_payload(payload)
     return entries
-
-
-def _revision_spec(path: Optional[str], reference: Any) -> Optional[str]:
-    """Combine a depot path with a Swarm/P4 revision reference."""
-    if not path or reference is None:
-        return None
-    ref = str(reference).strip()
-    if not ref:
-        return None
-    if ref.startswith("//"):
-        return ref
-    if ref.startswith(("@", "#")):
-        return f"{path}{ref}"
-    if ref.isdigit():
-        return f"{path}@={ref}"
-    return f"{path}{ref}" if ref[0] in "@#" else None
 
 
 def _positive_change(record: Any) -> Optional[str]:
@@ -187,11 +219,6 @@ def _positive_change(record: Any) -> Optional[str]:
     if isinstance(value, float) and value != number:
         return None
     return str(number) if number > 0 and str(value).strip() == str(number) else None
-
-
-def _change_kind(action: Any) -> str:
-    """Compatibility wrapper for the shared conservative action classifier."""
-    return change_kind(action)
 
 
 def _as_bool(value: Any) -> Optional[bool]:
@@ -226,21 +253,6 @@ def _describe_records(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, list) or not all(isinstance(item, Mapping) for item in payload):
         raise ValueError("p4 describe -S returned malformed metadata")
     return [dict(item) for item in payload]
-
-
-def _output_size(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, str):
-        return len(value.encode("utf-8"))
-    if isinstance(value, (bytes, bytearray)):
-        return len(value)
-    if isinstance(value, (list, tuple)):
-        return sum(
-            len(item.encode("utf-8")) if isinstance(item, str) else len(item)
-            for item in value if isinstance(item, (str, bytes, bytearray))
-        )
-    return 0
 
 
 def _expand_describe_files(records: Any) -> list[dict[str, Any]]:
@@ -433,14 +445,43 @@ class ReviewServices:
             api_base = await self._get_api_base()
             url = f"{api_base}/reviews/{review_id}"
             params = {}
+            added_identity_field = False
 
             if fields:
-                params["fields[]"] = fields
-            if include_transitions:
-                params["transitions"] = "true"
+                requested_fields = list(fields)
+                query_fields = list(requested_fields)
+                if include_transitions and "id" not in query_fields:
+                    query_fields.append("id")
+                    added_identity_field = True
+                params["fields[]"] = query_fields
 
             r = requests.get(url, auth=auth, params=params if params else None, verify=self.verify_ssl)
-            return {"status": "success", "message": self._handle_response(r)}
+            payload = self._handle_response(r)
+            if include_transitions:
+                # The query-string flag is ignored by supported Swarm v11
+                # servers. Fetch the dedicated endpoint and merge its fields
+                # into the same review object callers already consume.
+                transitions_response = requests.get(
+                    f"{url}/transitions",
+                    auth=auth,
+                    verify=self.verify_ssl,
+                )
+                transitions_payload = self._handle_response(transitions_response)
+                review = _review_reference(payload)
+                if review is None:
+                    raise ValueError(
+                        "Swarm review response did not contain one review for transitions"
+                    )
+                returned_id = review.get("id")
+                if (returned_id is None
+                        or str(returned_id).strip() != str(review_id).strip()):
+                    raise ValueError(
+                        "Swarm review response omitted or changed the requested review id"
+                    )
+                review.update(_transition_fields(transitions_payload))
+                if added_identity_field:
+                    review.pop("id", None)
+            return {"status": "success", "message": payload}
         except Exception as e:
             logger.error(f"Failed to get review info for '{review_id}': {e}")
             return {"status": "error", "message": str(e)}
@@ -531,74 +572,9 @@ class ReviewServices:
             detail = severe or unknown
             raise ValueError(f"{command} returned P4 diagnostics: {detail}")
 
-    async def _read_revision_bytes(self, p4, spec: str, max_bytes: int) -> bytes:
-        """Read one depot revision without allowing unbounded or malformed output."""
-        if not spec:
-            raise ValueError("a revision spec is required")
-        previous_tagged = getattr(p4, "tagged", True)
-        result = None
-        try:
-            p4.tagged = False
-            result = p4.run("print", "-q", spec)
-            self._check_p4_output(p4, result, f"p4 print {spec}")
-        finally:
-            p4.tagged = previous_tagged
-
-        if result is None:
-            result = []
-        if isinstance(result, (str, bytes, bytearray)):
-            result = [result]
-        if not isinstance(result, (list, tuple)):
-            raise ValueError(f"p4 print {spec} returned a malformed result")
-
-        if not result:
-            # An actually empty text revision is valid, so do not reject every
-            # empty response.  P4 commonly reports a missing revision as a
-            # severity-2 diagnostic (which is intentionally non-throwing at
-            # this connection's exception level); inspect that diagnostic
-            # before accepting an empty byte stream.
-            diagnostics = getattr(p4, "messages", None) or []
-            diagnostic_text = " ".join(str(message).lower() for message in diagnostics)
-            if any(marker in diagnostic_text for marker in (
-                    "no such", "not found", "does not exist", "unknown file",
-                    "no file", "revision does not exist")):
-                raise ValueError(f"p4 print {spec} reported a missing revision")
-
-        chunks: list[bytes] = []
-        total = 0
-        for item in result:
-            if isinstance(item, (bytes, bytearray)):
-                chunk = bytes(item)
-            elif isinstance(item, str):
-                chunk = item.encode("utf-8")
-            else:
-                raise ValueError(f"p4 print {spec} returned a non-text chunk")
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f"revision exceeds max_bytes={max_bytes}")
-            chunks.append(chunk)
-        return b"".join(chunks)
-
     @staticmethod
     def _expand_review_file_entries(payload: Any) -> tuple[list[dict[str, Any]], bool]:
         return _review_files_payload(payload)
-
-    @staticmethod
-    def _p4_describe_unified(
-            p4, changelist_id: str, context_lines: int = 3) -> Any:
-        """Read the authoritative diff of a pending shelf."""
-        previous_tagged = getattr(p4, "tagged", True)
-        try:
-            p4.tagged = False
-            raw = p4.run(
-                "describe", "-a", "-S", f"-du{context_lines}",
-                str(changelist_id),
-            )
-            ReviewServices._check_p4_output(
-                p4, raw, f"p4 describe -du{context_lines} -S {changelist_id}")
-            return raw
-        finally:
-            p4.tagged = previous_tagged
 
     @staticmethod
     def _p4_describe_shelf(p4, changelist_id: str) -> list[dict[str, Any]]:
@@ -608,11 +584,11 @@ class ReviewServices:
             p4.tagged = True
             runner = getattr(p4, "run_describe", None)
             if callable(runner):
-                result = runner("-S", str(changelist_id))
+                result = runner("-s", "-S", str(changelist_id))
             else:
-                result = p4.run("describe", "-S", str(changelist_id))
+                result = p4.run("describe", "-s", "-S", str(changelist_id))
             ReviewServices._check_p4_output(
-                p4, result, f"p4 describe -S {changelist_id}")
+                p4, result, f"p4 describe -s -S {changelist_id}")
             records = _describe_records(result)
             if not records:
                 raise ValueError("p4 describe -S returned no changelist record")
@@ -634,30 +610,6 @@ class ReviewServices:
             p4.tagged = previous_tagged
 
     @staticmethod
-    def _p4_diff2_unified(
-            p4, left_spec: str, right_spec: str, context_lines: int = 3) -> Any:
-        """Read a two-sided unified diff while preserving diff2 headers."""
-        previous_tagged = getattr(p4, "tagged", True)
-        try:
-            p4.tagged = False
-            raw = p4.run("diff2", f"-du{context_lines}", left_spec, right_spec)
-            ReviewServices._check_p4_output(
-                p4, raw,
-                f"p4 diff2 -du{context_lines} {left_spec} {right_spec}")
-            return raw
-        finally:
-            p4.tagged = previous_tagged
-
-    @staticmethod
-    def _presence_for_action(action: Any) -> tuple[bool, bool]:
-        if action is None or not str(action).strip():
-            return False, False
-        kind = _change_kind(action)
-        if kind == "unknown":
-            return False, False
-        return kind != "add", kind != "delete"
-
-    @staticmethod
     def _diff_error(review_id: int, detail: Any, **extra: Any) -> Dict[str, Any]:
         message: Dict[str, Any] = {"review_id": review_id, "detail": str(detail)}
         message.update(extra)
@@ -671,14 +623,16 @@ class ReviewServices:
             context_lines: int = 3,
             max_files: int = 200,
             max_bytes: int = 5_000_000,
+            after_file: Optional[str] = None,
+            max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
         ) -> Dict[str, Any]:
-        """Return line-addressable hunks for a review version range.
+        """Return a bounded, line-addressable page for a review version range.
 
-        ``get_review_files`` remains the backwards-compatible metadata API.
-        This opt-in method uses its ``diffFrom``/``diffTo`` references when
-        available and otherwise derives a safe base from the selected review
-        version.  Binary files and files over ``max_bytes`` are represented as
-        explicit unsupported entries; they are never decoded as source text.
+        The latest pending version is read from its authoritative shelf
+        inventory. Metadata is sorted and paged before any content command is
+        issued; each selected file is then expanded independently. Binary and
+        oversized files remain visible as unsupported summaries without
+        unsafe or partial hunks.
         """
         if context_lines < 0 or context_lines > 100:
             return {"status": "error", "message": "context_lines must be between 0 and 100"}
@@ -686,6 +640,11 @@ class ReviewServices:
             return {"status": "error", "message": "max_files must be positive"}
         if max_bytes < 1:
             return {"status": "error", "message": "max_bytes must be positive"}
+        if max_total_bytes < MIN_MAX_TOTAL_BYTES:
+            return {
+                "status": "error",
+                "message": f"max_total_bytes must be at least {MIN_MAX_TOTAL_BYTES}",
+            }
 
         info_result = await self.get_review_info(
             review_id, fields=["id", "versions", "pending", "state"])
@@ -701,27 +660,34 @@ class ReviewServices:
         review = _review_from_payload(info_result)
         if not review:
             return self._diff_error(
-                review_id, "Swarm response did not contain a review object")
-        returned_id = review.get("id")
-        if returned_id is not None and str(returned_id).strip() != str(review_id).strip():
-            return self._diff_error(
                 review_id,
-                "Swarm returned metadata for a different review",
+                "Swarm response did not contain exactly one review object "
+                "with the requested review id",
                 stage="review-metadata",
                 retryable=False,
             )
+        returned_id = review.get("id")
+        if (returned_id is None
+                or str(returned_id).strip() != str(review_id).strip()):
+            return self._diff_error(
+                review_id,
+                "Swarm metadata omitted or changed the requested review id",
+                stage="review-metadata",
+                retryable=False,
+            )
+
         versions = review.get("versions")
         if not isinstance(versions, list) or not versions:
             return self._diff_error(
                 review_id, "Review has no versions; cannot establish diff revisions")
-
         total_versions = len(versions)
         effective_to = to_version if to_version is not None else total_versions
         effective_from = from_version
         if effective_to < 1 or effective_to > total_versions:
             return self._diff_error(
                 review_id, f"to_version must be between 1 and {total_versions}")
-        if effective_from is not None and (effective_from < 0 or effective_from >= effective_to):
+        if effective_from is not None and (
+                effective_from < 0 or effective_from >= effective_to):
             return self._diff_error(
                 review_id, "from_version must be >= 0 and less than to_version")
 
@@ -741,22 +707,30 @@ class ReviewServices:
             return self._diff_error(
                 review_id, "Selected review version has no usable changelist",
                 stage="review-version", version=effective_to, retryable=False)
+        if effective_from and not from_change:
+            return self._diff_error(
+                review_id, "Starting review version has no usable changelist",
+                stage="review-version", version=effective_from, retryable=False)
 
-        # Never infer a missing pending flag as ``false``.  The distinction is
-        # safety-critical: a submitted change may expose depotFile metadata but
-        # cannot be used as a live review shelf.  For the latest version only,
-        # Swarm's top-level flag is an acceptable fallback when the per-version
-        # field was omitted by a field-limited response.
-        version_pending_value = _as_bool(to_record.get("pending"))
-        review_pending_value = (
-            _as_bool(review.get("pending"))
-            if effective_to == total_versions else None
+        version_has_pending = "pending" in to_record
+        version_pending_value = (
+            _as_bool(to_record.get("pending")) if version_has_pending else None
         )
-        # For the latest version both fields describe the same Swarm state.
-        # A contradiction is not safe to resolve by preference: choosing the
-        # top-level flag could make us read a submitted depot revision as a
-        # live shelf, while choosing the version flag could hide a just-
-        # submitted review.  Stop and require fresh, consistent metadata.
+        if version_has_pending and version_pending_value is None:
+            return self._diff_error(
+                review_id,
+                "Selected review version has an invalid pending flag",
+                stage="review-version",
+                version=effective_to,
+                pendingKnown=False,
+                retryable=False,
+            )
+        review_has_pending = (
+            effective_to == total_versions and "pending" in review
+        )
+        review_pending_value = (
+            _as_bool(review.get("pending")) if review_has_pending else None
+        )
         if (version_pending_value is not None
                 and review_pending_value is not None
                 and version_pending_value != review_pending_value):
@@ -764,502 +738,172 @@ class ReviewServices:
                 review_id,
                 "Review pending metadata is contradictory between the selected "
                 "latest version and the review object",
-                stage="review-version", version=effective_to,
-                pendingKnown=False, retryable=True,
+                stage="review-version",
+                version=effective_to,
+                pendingKnown=False,
+                retryable=True,
             )
         target_pending_value = version_pending_value
-        if target_pending_value is None and effective_to == total_versions:
+        # Older Swarm payloads can omit the per-version flag.  Only absence
+        # permits the documented latest-review fallback; an explicit null or
+        # malformed value above remains an error instead of silently trusting
+        # a different field.
+        if not version_has_pending and effective_to == total_versions:
             target_pending_value = review_pending_value
         if target_pending_value is None:
             return self._diff_error(
                 review_id,
                 "Selected review version has no reliable pending flag",
-                stage="review-version", version=effective_to,
-                pendingKnown=False, retryable=False,
+                stage="review-version",
+                version=effective_to,
+                pendingKnown=False,
+                retryable=False,
             )
         target_pending = target_pending_value is True
-
-        files_result = await self.get_review_files(
-            review_id,
-            from_version=from_version,
-            to_version=to_version,
-        )
-        if not isinstance(files_result, Mapping):
+        if to_version is None and not target_pending:
             return self._diff_error(
                 review_id,
-                "Swarm review files response has an invalid envelope",
-                stage="review-files",
-                retryable=True,
+                "The latest review version is not pending; there is no live "
+                "review shelf to use as the default diff source",
+                stage="review-version",
+                version=effective_to,
+                pending=False,
+                shelfPresent=False,
+                retryable=False,
             )
-        if files_result.get("status") != "success":
-            return files_result
-        try:
-            entries, metadata_limited = self._expand_review_file_entries(
-                files_result.get("message"))
-        except (TypeError, ValueError) as exc:
-            return self._diff_error(review_id, exc, stage="review-files")
 
-        # A non-pending or explicitly ranged review must have a concrete file
-        # inventory from Swarm.  An empty response can otherwise look like a
-        # successful no-op and conceal an endpoint/permission failure.  The
-        # default pending path is allowed to proceed because it obtains a
-        # second, authoritative inventory from ``p4 describe -S`` below.
-        if not entries and not (target_pending and effective_from is None):
-            return self._diff_error(
-                review_id,
-                "Swarm returned an empty review file list; refusing to claim a complete diff",
-                stage="review-files", fromVersion=effective_from,
-                toVersion=effective_to, complete=False, retryable=True)
-
-        warnings: list[str] = []
-        errors: list[dict[str, Any]] = []
-        omitted = max(0, len(entries) - max_files)
-        if omitted:
-            warnings.append(f"{omitted} file(s) omitted because max_files={max_files}")
-        entries_to_expand = entries[:max_files]
-        expanded: list[dict[str, Any]] = []
-        parsed_complete = True
+        metadata_limited = False
         shelf_present = False
-        # In the default pending path P4's tagged shelf inventory is the
-        # authoritative file list. Keep its omitted tail separately from the
-        # Swarm HTTP inventory, which may be empty or limited.
-        omitted_paths: list[str] = []
-
-        # For a default pending-review diff, ``describe -du -S`` is the
-        # authoritative shelf-vs-base representation and also gives useful
-        # framing for deletes/binaries.  When the caller explicitly requests a
-        # version range, use each file's ``diffFrom``/``diffTo`` refs (or the
-        # selected version CLs) and read both revisions directly.  On this
-        # server ``path@=CL`` reliably distinguishes two pending shelves; the
-        # old implementation incorrectly substituted the latest shelf-vs-base
-        # diff even when ``from_version`` was supplied.
-        if target_pending and effective_from is None:
-            try:
+        source = "p4-file-diff"
+        try:
+            if target_pending and effective_from is None:
+                # The current pending shelf is authoritative. describe -s -S
+                # returns only its lightweight file inventory; unlike -du it
+                # never transfers the complete shelf before max_files applies.
                 async with self.connection_manager.get_connection() as p4:
-                    # ``review.files`` is not a shelf-presence proof.  Confirm
-                    # the selected CL is still pending and has concrete
-                    # shelved files before interpreting an empty ``describe``
-                    # response as a clean diff.
-                    shelf_entries = self._p4_describe_shelf(p4, to_change)
-                    raw = self._p4_describe_unified(p4, to_change, context_lines)
-                    if _output_size(raw) > _MAX_STRUCTURED_DIFF_OUTPUT_BYTES:
-                        raise ValueError(
-                            "structured review diff exceeds the server response safety "
-                            f"limit ({_MAX_STRUCTURED_DIFF_OUTPUT_BYTES} bytes)")
-                    parsed = parse_unified_diff(
-                        raw,
-                        context_lines=context_lines,
-                        metadata={"files": shelf_entries},
-                        max_bytes=max_bytes,
+                    entries = self._p4_describe_shelf(p4, to_change)
+                    plan = prepare_diff_page(
+                        entries,
+                        max_files,
+                        after_file,
+                        inventory_identity={
+                            "kind": "review-shelf",
+                            "reviewId": review_id,
+                            "fromVersion": effective_from,
+                            "toVersion": effective_to,
+                            "fromChange": from_change,
+                            "toChange": to_change,
+                            "pending": target_pending,
+                        },
                     )
-                    # ``p4 describe -du -S`` omits text adds/deletes on some
-                    # server versions.  Read the one existing side to recover
-                    # safe one-sided anchors instead of silently reporting an
-                    # incomplete diff for newly added/removed source files.
-                    shelf_by_path = {
-                        entry.get("depotFile"): entry for entry in shelf_entries
-                        if entry.get("depotFile")
-                    }
-                    # Recovery reads depot content one file at a time.  Keep
-                    # that work within the caller's expansion budget; files
-                    # beyond ``max_files`` are represented as omitted rather
-                    # than silently consuming additional P4 reads.
-                    recoverable_reasons = {
-                        "no unified diff section",
-                        "added file section has no diff content",
-                        "file section has no diff content",
-                        "file section has no unified hunk",
-                    }
-                    for parsed_item in (parsed.get("files", []) or [])[:max_files]:
-                        if parsed_item.get("supported", False) or parsed_item.get("binary"):
-                            continue
-                        if parsed_item.get("hunks"):
-                            continue
-                        if parsed_item.get("reason") not in recoverable_reasons:
-                            continue
-                        action = parsed_item.get("action")
-                        if action is None or not str(action).strip():
-                            # A revision number alone cannot distinguish an
-                            # edit from an add/delete. Never synthesize an
-                            # anchor when the authoritative inventory omitted
-                            # the action.
-                            parsed_item["reason"] = "missing file action"
-                            continue
-                        kind = _change_kind(action)
-                        if kind == "unknown":
-                            continue
-                        metadata_entry = shelf_by_path.get(parsed_item.get("depotFile"), {})
-                        path = parsed_item.get("depotFile")
-                        try:
-                            revision = int(metadata_entry.get("rev"))
-                        except (TypeError, ValueError):
-                            revision = 0
-                        if kind == "add":
-                            left_spec = None
-                            right_spec = _revision_spec(path, f"@={to_change}")
-                        elif kind == "delete":
-                            left_spec = _revision_spec(
-                                path, f"#{revision}" if revision > 0 else None)
-                            right_spec = None
-                        else:
-                            left_spec = _revision_spec(
-                                path, f"#{revision}" if revision > 0 else None)
-                            right_spec = _revision_spec(path, f"@={to_change}")
-                        if ((kind == "add" and right_spec is None)
-                                or (kind == "delete" and left_spec is None)
-                                or (kind == "edit" and (left_spec is None or right_spec is None))):
-                            continue
-                        try:
-                            left_bytes = await self._read_revision_bytes(
-                                p4, left_spec, max_bytes) if left_spec else b""
-                            right_bytes = await self._read_revision_bytes(
-                                p4, right_spec, max_bytes) if right_spec else b""
-                            declared_type = str(
-                                metadata_entry.get("type") or "").lower()
-                            if looks_binary(left_bytes, declared_type) or looks_binary(right_bytes, declared_type):
-                                parsed_item.update({
-                                    "binary": True,
-                                    "supported": False,
-                                    "complete": False,
-                                    "reason": "binary content detected; line diff unavailable",
-                                })
-                                continue
-                            recovered = build_hunks(left_bytes, right_bytes, context_lines)
-                            parsed_item.update(recovered)
-                            parsed_item.update({
-                                "source": "p4-print-shelf",
-                                "binary": False,
-                                "supported": True,
-                                "complete": True,
-                                "fromRevision": f"#{revision}" if left_spec else None,
-                                "toRevision": f"@={to_change}" if right_spec else None,
-                                "recoveredFromMissingSection": True,
-                            })
-                            # The parser's original reason described the
-                            # missing unified section.  Once recovery succeeds
-                            # it must not remain alongside a complete hunk.
-                            parsed_item.pop("reason", None)
-                            if "utf-8-replace" in {
-                                    recovered.get("oldEncoding"), recovered.get("newEncoding")}:
-                                parsed_item.update({
-                                    "supported": False, "complete": False,
-                                    "reason": "content could not be decoded without replacement",
-                                })
-                        except Exception as recovery_error:
-                            parsed_item["reason"] = str(recovery_error)
-                if not parsed.get("files"):
+                    page = StructuredDiffPage(plan, max_total_bytes)
+                    for entry in plan.candidates:
+                        item = await build_structured_file(
+                            p4,
+                            entry,
+                            target_pending=True,
+                            to_change=to_change,
+                            from_change=None,
+                            effective_from=None,
+                            context_lines=context_lines,
+                            max_bytes=max_bytes,
+                            check_output=self._check_p4_output,
+                        )
+                        if not page.append(item) or page.budget_limited:
+                            break
+                shelf_present = True
+                source = "p4-shelf-files"
+            else:
+                files_result = await self.get_review_files(
+                    review_id,
+                    from_version=effective_from,
+                    to_version=effective_to,
+                )
+                if not isinstance(files_result, Mapping):
                     return self._diff_error(
                         review_id,
-                        "The pending shelf returned no line-addressable file sections",
-                        stage="p4-describe-shelf", sourceChange=to_change,
-                        fromVersion=effective_from, toVersion=effective_to,
-                        shelfPresent=True, complete=False, retryable=True,
+                        "Swarm review files response has an invalid envelope",
+                        stage="review-files",
+                        retryable=True,
                     )
-                # The P4 inventory is authoritative for a pending shelf.  It
-                # may contain more files than the Swarm metadata response (or
-                # the caller's max_files cap), so compute omission from this
-                # validated inventory as well as from the HTTP response.
-                omitted = max(omitted, max(0, len(shelf_entries) - max_files))
-                if omitted:
-                    if not any("omitted because max_files" in w for w in warnings):
-                        warnings.append(
-                            f"{omitted} file(s) omitted because max_files={max_files}")
-                    omitted_paths = [
-                        entry.get("depotFile") for entry in shelf_entries[max_files:]
-                        if entry.get("depotFile")
-                    ]
-                expanded = parsed.get("files", [])[:max_files]
-                # Recovery may turn a parser-level "missing section" into a
-                # complete one-sided add/delete.  Recompute from the actual
-                # returned records rather than trusting the parser's stale
-                # aggregate flag.
-                parsed_complete = bool(expanded) and all(
-                    item.get("supported", False)
-                    and item.get("complete", False)
-                    for item in expanded
+                if files_result.get("status") != "success":
+                    return files_result
+                try:
+                    entries, metadata_limited = self._expand_review_file_entries(
+                        files_result.get("message"))
+                except (TypeError, ValueError) as exc:
+                    return self._diff_error(
+                        review_id, exc, stage="review-files", retryable=True)
+                if not entries:
+                    return self._diff_error(
+                        review_id,
+                        "Swarm returned an empty review file list; refusing to claim a complete diff",
+                        stage="review-files",
+                        fromVersion=effective_from,
+                        toVersion=effective_to,
+                        complete=False,
+                        retryable=True,
+                    )
+                plan = prepare_diff_page(
+                    entries,
+                    max_files,
+                    after_file,
+                    inventory_identity={
+                        "kind": "review-range",
+                        "reviewId": review_id,
+                        "fromVersion": effective_from,
+                        "toVersion": effective_to,
+                        "fromChange": from_change,
+                        "toChange": to_change,
+                        "pending": target_pending,
+                    },
                 )
-                if parsed.get("limited") or parsed.get("unexpectedFiles"):
-                    parsed_complete = False
-                shelf_present = True
-                for item in expanded:
-                    item.setdefault("source", "p4-describe-shelf")
-                    # The textual describe stream does not always carry the
-                    # exact before/after refs. Fill them from the validated
-                    # pending-shelf inventory so every file remains tied to
-                    # the selected latest review version.
-                    metadata_entry = shelf_by_path.get(item.get("depotFile"), {})
-                    action = item.get("action") or metadata_entry.get("action")
-                    kind = (_change_kind(action)
-                            if action is not None and str(action).strip()
-                            else "unknown")
-                    if action is not None and str(action).strip():
-                        item.setdefault("action", action)
-                    if metadata_entry.get("type") is not None:
-                        item.setdefault("type", metadata_entry.get("type"))
-                    try:
-                        revision = int(metadata_entry.get("rev"))
-                    except (TypeError, ValueError):
-                        revision = 0
-                    if kind == "add":
-                        item.setdefault("fromRevision", None)
-                        item.setdefault("toRevision", f"@={to_change}")
-                    elif kind == "delete":
-                        if revision > 0:
-                            item.setdefault("fromRevision", f"#{revision}")
-                        item.setdefault("toRevision", None)
-                    elif kind == "edit":
-                        if revision > 0:
-                            item.setdefault("fromRevision", f"#{revision}")
-                        item.setdefault("toRevision", f"@={to_change}")
-                    left_present, right_present = self._presence_for_action(
-                        item.get("action"))
-                    item.setdefault("leftPresent", left_present)
-                    item.setdefault("rightPresent", right_present)
-                    if not item.get("supported", False):
-                        errors.append(item)
-            except Exception as exc:
-                # A failed P4 command is different from a successfully read
-                # binary/unsupported file.  Returning ``status=success`` with
-                # synthetic empty hunks would let a caller mistake an
-                # infrastructure outage for a clean review, so fail closed
-                # and make the retry boundary explicit.
-                return self._diff_error(
-                    review_id,
-                    f"Could not read pending shelf diff: {exc}",
-                    stage="p4-describe-shelf",
-                    sourceChange=to_change,
-                    fromVersion=effective_from,
-                    toVersion=effective_to,
-                    retryable=True,
-                )
-        else:
-            async with self.connection_manager.get_connection() as p4:
-                # An explicit range ending in a pending version still relies
-                # on a live shelf for its right-hand revision.  Validate it
-                # before issuing per-file diff commands; otherwise a missing
-                # shelf can be reported as a collection of misleading empty
-                # files.  For submitted versions this check is intentionally
-                # skipped because the right side is a depot revision.
-                if target_pending:
-                    try:
+                page = StructuredDiffPage(plan, max_total_bytes)
+                async with self.connection_manager.get_connection() as p4:
+                    if target_pending:
                         self._p4_describe_shelf(p4, to_change)
-                    except Exception as exc:
-                        return self._diff_error(
-                            review_id,
-                            f"Could not verify the selected pending shelf: {exc}",
-                            stage="p4-describe-shelf",
-                            sourceChange=to_change,
-                            fromVersion=effective_from,
-                            toVersion=effective_to,
-                            shelfPresent=False,
-                            retryable=True,
+                        shelf_present = True
+                    for entry in plan.candidates:
+                        item = await build_structured_file(
+                            p4,
+                            entry,
+                            target_pending=target_pending,
+                            to_change=to_change,
+                            from_change=from_change,
+                            effective_from=effective_from,
+                            context_lines=context_lines,
+                            max_bytes=max_bytes,
+                            check_output=self._check_p4_output,
                         )
-                    shelf_present = True
-                for entry in entries_to_expand:
-                    depot_file = entry.get("depotFile") or entry.get("toFile")
-                    old_file = entry.get("fromFile") or entry.get("oldFile") or depot_file
-                    action = entry.get("action")
-                    kind = _change_kind(action)
-                    file_type = str(
-                        entry.get("type") or entry.get("fileType") or entry.get("filetype") or ""
-                    ).lower()
-                    item: dict[str, Any] = {
-                        "depotFile": depot_file,
-                        "fromFile": old_file if old_file != depot_file else None,
-                        "action": action,
-                        "type": entry.get("type"),
-                        "fromRevision": entry.get("diffFrom"),
-                        "toRevision": entry.get("diffTo"),
-                        "hunks": [],
-                        "source": "p4-print",
-                        "leftPresent": kind != "add",
-                        "rightPresent": kind != "delete",
-                    }
+                        if not page.append(item) or page.budget_limited:
+                            break
+        except ValueError as exc:
+            stage = "file-pagination" if "after_file" in str(exc) else "p4-file-diff"
+            return self._diff_error(
+                review_id,
+                exc,
+                stage=stage,
+                sourceChange=to_change,
+                fromVersion=effective_from,
+                toVersion=effective_to,
+                restartRequired=stage == "file-pagination",
+                retryable=stage != "file-pagination",
+            )
+        except Exception as exc:
+            return self._diff_error(
+                review_id,
+                f"Could not read structured review diff: {exc}",
+                stage="p4-file-diff",
+                sourceChange=to_change,
+                fromVersion=effective_from,
+                toVersion=effective_to,
+                retryable=True,
+            )
 
-                    if "binary" in file_type:
-                        item.update({"binary": True, "supported": False,
-                                     "complete": False,
-                                     "reason": "binary file; line diff unavailable"})
-                        errors.append(item)
-                        expanded.append(item)
-                        continue
-                    if action is None or not str(action).strip():
-                        item.update({
-                            "supported": False,
-                            "complete": False,
-                            "reason": "missing file action",
-                            "leftPresent": False,
-                            "rightPresent": False,
-                        })
-                        errors.append(item)
-                        expanded.append(item)
-                        continue
-                    if action is not None and str(action).strip() \
-                            and kind == "unknown":
-                        item.update({
-                            "supported": False,
-                            "complete": False,
-                            "reason": f"unsupported file action: {action}",
-                        })
-                        errors.append(item)
-                        expanded.append(item)
-                        continue
-                    if not depot_file:
-                        item.update({"supported": False, "complete": False,
-                                     "reason": "missing depotFile"})
-                        errors.append(item)
-                        expanded.append(item)
-                        continue
-
-                    # Swarm supplies exact ``@=CL`` refs for a non-zero
-                    # version range.  For a full/post-commit diff, derive the
-                    # adjacent depot revision from ``rev`` when the endpoint
-                    # omits those refs.  A delete's old side is ``#rev`` (the
-                    # last existing revision).  For a pending shelf, an edit
-                    # also uses ``#rev`` because that is the depot base and
-                    # ``@=to_change`` is the shelf.  Only a submitted
-                    # revision falls back to ``#(rev-1)``.
-                    try:
-                        revision = int(entry.get("rev"))
-                    except (TypeError, ValueError):
-                        revision = 0
-                    target_ref = entry.get("diffTo")
-                    if target_ref is None:
-                        target_ref = (
-                            f"@={to_change}" if target_pending
-                            else (f"#{revision}" if revision > 0 else None)
-                        )
-                    # ``from_version=0`` explicitly means the depot base.  A
-                    # stale/incorrect ``diffFrom`` returned by a proxy must
-                    # not silently turn that request into a version-to-version
-                    # diff.  For a positive starting version, retain Swarm's
-                    # precise diffFrom reference when available.
-                    base_ref = (
-                        None if effective_from == 0
-                        else entry.get("diffFrom")
-                    )
-                    if base_ref is None and from_change:
-                        base_ref = f"@={from_change}"
-                    if kind == "edit" and base_ref is None and revision > 0:
-                        base_ref = (
-                            f"#{revision}" if target_pending else
-                            (f"#{revision - 1}" if revision > 1 else None)
-                        )
-                    if kind == "delete" and base_ref is None and revision > 0:
-                        base_ref = f"#{revision}"
-
-                    if kind == "add":
-                        left_ref = None
-                        right_ref = target_ref
-                    elif kind == "delete":
-                        left_ref = base_ref
-                        right_ref = None
-                    else:
-                        left_ref = base_ref
-                        right_ref = target_ref
-
-                    item["fromRevision"] = left_ref
-                    item["toRevision"] = right_ref
-                    item["exactRange"] = bool(
-                        effective_from is not None
-                        and effective_from > 0
-                        and (entry.get("diffFrom") is not None
-                             or from_change is not None)
-                    )
-
-                    left_spec = _revision_spec(old_file, left_ref)
-                    right_spec = _revision_spec(depot_file, right_ref)
-                    size_hint = entry.get("fileSize")
-                    try:
-                        if size_hint is not None and int(size_hint) > max_bytes:
-                            raise ValueError(
-                                f"file metadata size {size_hint} exceeds max_bytes={max_bytes}")
-                    except (TypeError, ValueError) as exc:
-                        item.update({"supported": False, "complete": False,
-                                     "reason": str(exc)})
-                        errors.append(item)
-                        warnings.append(f"{depot_file}: {exc}")
-                        expanded.append(item)
-                        continue
-
-                    if ((kind == "edit" and (left_spec is None or right_spec is None))
-                            or (kind == "add" and right_spec is None)
-                            or (kind == "delete" and left_spec is None)):
-                        item.update({
-                            "supported": False, "complete": False,
-                            "reason": "missing reliable before/after revision reference",
-                        })
-                        errors.append(item)
-                        expanded.append(item)
-                        continue
-                    try:
-                        if kind == "edit":
-                            # For an edit, ask the server for a real diff2
-                            # result.  Besides avoiding an unnecessary pair of
-                            # full ``print`` calls, this preserves the two
-                            # depot paths and the server's identical/types
-                            # summary in the structured record.
-                            raw = self._p4_diff2_unified(
-                                p4, left_spec, right_spec, context_lines)
-                            if _output_size(raw) > _MAX_STRUCTURED_DIFF_OUTPUT_BYTES:
-                                raise ValueError(
-                                    "structured file diff exceeds the server response safety "
-                                    f"limit ({_MAX_STRUCTURED_DIFF_OUTPUT_BYTES} bytes)")
-                            parsed = parse_unified_diff(
-                                raw,
-                                context_lines=context_lines,
-                                metadata={"files": [entry]},
-                                max_bytes=max_bytes,
-                            )
-                            parsed_files = parsed.get("files") or []
-                            if len(parsed_files) != 1:
-                                raise ValueError(
-                                    "p4 diff2 did not return exactly one file section")
-                            parsed_item = dict(parsed_files[0])
-                            item.update(parsed_item)
-                            item["source"] = "p4-diff2"
-                            item["fromRevision"] = left_ref
-                            item["toRevision"] = right_ref
-                            if not item.get("supported", False):
-                                errors.append(item)
-                        else:
-                            # diff2 emits header-only sections for adds and
-                            # deletes.  Read the one existing side so those
-                            # files still receive safe one-sided anchors.
-                            left_bytes = await self._read_revision_bytes(
-                                p4, left_spec, max_bytes) if left_spec else b""
-                            right_bytes = await self._read_revision_bytes(
-                                p4, right_spec, max_bytes) if right_spec else b""
-                            if looks_binary(left_bytes, file_type) or looks_binary(right_bytes, file_type):
-                                item.update({"binary": True, "supported": False,
-                                             "complete": False,
-                                             "reason": "binary content detected; line diff unavailable"})
-                                errors.append(item)
-                            else:
-                                diff = build_hunks(left_bytes, right_bytes, context_lines)
-                                item.update(diff)
-                                item["binary"] = False
-                                item["supported"] = True
-                                item["complete"] = True
-                                if "utf-8-replace" in {
-                                        diff.get("oldEncoding"), diff.get("newEncoding")}:
-                                    item.update({
-                                        "supported": False, "complete": False,
-                                        "reason": "content could not be decoded without replacement",
-                                        "encodingWarning": True,
-                                    })
-                                    errors.append(item)
-                    except Exception as exc:
-                        item.update({"supported": False, "complete": False,
-                                     "reason": str(exc)})
-                        errors.append(item)
-                    expanded.append(item)
-
-        result = {
+        base = {
             "reviewId": review_id,
             "fromVersion": effective_from,
             "toVersion": effective_to,
-            "files": expanded,
             "sourceChange": to_change,
             "versionChange": to_change,
             "pending": target_pending,
@@ -1267,34 +911,23 @@ class ReviewServices:
             "contextLines": context_lines,
             "maxFiles": max_files,
             "maxBytes": max_bytes,
-            "complete": (
-                parsed_complete and not errors and not omitted and not metadata_limited
-            ),
-            "warnings": warnings,
+            "source": source,
+            "warnings": [],
         }
-        if metadata_limited:
-            result["limited"] = True
-            warnings.append("Swarm file metadata was limited; the diff is incomplete.")
-        if omitted:
-            omitted_source = omitted_paths or [
-                entry.get("depotFile") or entry.get("toFile")
-                for entry in entries[max_files:]
-            ]
-            result["omittedFiles"] = [
-                path for path in omitted_source if path
-            ]
-        if errors:
-            result["errors"] = [
-                {"depotFile": e.get("depotFile"), "reason": e.get("reason")}
-                for e in errors
-            ]
-        # The raw unified stream is useful while debugging the parser but is
-        # not part of the line-addressable API contract.  Returning it would
-        # duplicate potentially multi-megabyte shelf content in every MCP
-        # response and defeat the max-files/max-bytes safeguards.
-        result.pop("raw", None)
+        try:
+            result = page.finish(base, metadata_limited=metadata_limited)
+        except ValueError as exc:
+            return self._diff_error(
+                review_id,
+                exc,
+                stage="response-budget",
+                sourceChange=to_change,
+                fromVersion=effective_from,
+                toVersion=effective_to,
+                retryable=False,
+            )
         return {"status": "success", "message": result}
-        
+
     async def get_review_activity(
             self, 
             review_id: int, 

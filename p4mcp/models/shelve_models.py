@@ -53,13 +53,26 @@ class QueryShelvesParams(PaginatedParams):
         default=200,
         ge=1,
         le=1000,
-        description="Maximum files to expand in a structured shelf diff",
+        description="Maximum files in one structured-diff page; applied before content is read",
     )
     max_bytes: int = Field(
         default=5_000_000,
         ge=1,
         le=100_000_000,
         description="Maximum parsed bytes per file in a structured shelf diff",
+    )
+    after_file: Optional[str] = Field(
+        default=None,
+        description=(
+            "Exclusive structured-diff file cursor. Pass the exact lastSeen "
+            "depot path from the preceding page."
+        ),
+    )
+    max_total_bytes: int = Field(
+        default=10_000_000,
+        ge=65_536,
+        le=100_000_000,
+        description="Hard UTF-8 JSON byte budget for one structured-diff payload",
     )
 
     @model_validator(mode='after')

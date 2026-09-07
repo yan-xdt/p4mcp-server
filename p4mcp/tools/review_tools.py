@@ -36,7 +36,10 @@ def register(server: "P4MCPServer") -> None:
         )] = None,
         fields: Annotated[Optional[List[str]], Field(
             default=None,
-            description="List of fields to return for list/get actions",
+            description=(
+                "Fields to return for list/get actions. Swarm list does not expose "
+                "versions; enumerate IDs, then use get for version data."
+            ),
             examples=[["id", "description", "author", "state"], ["id", "author", "state", "participants", "commits"]],
         )] = None,
         comments_fields: Annotated[Optional[str], Field(
@@ -72,12 +75,23 @@ def register(server: "P4MCPServer") -> None:
         )] = 3,
         max_files: Annotated[int, Field(
             default=200, ge=1, le=1000,
-            description="Maximum number of files to expand in a structured diff",
+            description="Maximum files in one structured-diff page; applied before content is read",
         )] = 200,
         max_bytes: Annotated[int, Field(
             default=5_000_000, ge=1, le=100_000_000,
             description="Maximum bytes to read per file in a structured diff",
         )] = 5_000_000,
+        after_file: Annotated[Optional[str], Field(
+            default=None,
+            description=(
+                "Exclusive structured-diff cursor: exact depot path from the "
+                "preceding page's lastSeen field"
+            ),
+        )] = None,
+        max_total_bytes: Annotated[int, Field(
+            default=10_000_000, ge=65_536, le=100_000_000,
+            description="Hard UTF-8 JSON byte budget for one structured-diff payload",
+        )] = 10_000_000,
         max_results: Annotated[int, Field(
             default=10,
             description="Maximum number of results to return",
@@ -139,6 +153,7 @@ def register(server: "P4MCPServer") -> None:
             up_voters=up_voters, from_version=from_version,
             to_version=to_version, structured=structured, max_results=max_results,
             context_lines=context_lines, max_files=max_files, max_bytes=max_bytes,
+            after_file=after_file, max_total_bytes=max_total_bytes,
             after=after, after_updated=after_updated,
             result_order=result_order, projects=projects,
             state=state, keywords=keywords,

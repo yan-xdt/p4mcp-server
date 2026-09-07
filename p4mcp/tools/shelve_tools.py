@@ -48,12 +48,23 @@ def register(server: "P4MCPServer") -> None:
         )] = 3,
         max_files: Annotated[int, Field(
             default=200, ge=1, le=1000,
-            description="Maximum files to expand in a structured shelf diff",
+            description="Maximum files in one structured-diff page; applied before content is read",
         )] = 200,
         max_bytes: Annotated[int, Field(
             default=5_000_000, ge=1, le=100_000_000,
             description="Maximum parsed bytes per file in a structured shelf diff",
         )] = 5_000_000,
+        after_file: Annotated[Optional[str], Field(
+            default=None,
+            description=(
+                "Exclusive structured-diff cursor: exact depot path from the "
+                "preceding page's lastSeen field"
+            ),
+        )] = None,
+        max_total_bytes: Annotated[int, Field(
+            default=10_000_000, ge=65_536, le=100_000_000,
+            description="Hard UTF-8 JSON byte budget for one structured-diff payload",
+        )] = 10_000_000,
         max_results: Annotated[int, Field(
             default=100, ge=1, le=1000,
             description="Maximum number of results to return",
@@ -68,6 +79,7 @@ def register(server: "P4MCPServer") -> None:
             action=action, changelist_id=changelist_id,
             user=user, structured=structured, context_lines=context_lines,
             max_files=max_files, max_bytes=max_bytes,
+            after_file=after_file, max_total_bytes=max_total_bytes,
             max_results=max_results,
         )
         return await handle_with_logging(server, "query", "shelves", params, "query_shelves", ctx)

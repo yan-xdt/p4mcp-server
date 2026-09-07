@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 import re
-from typing import Any, Iterable, List, Mapping, Optional
+from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
 
 def decode_text(value: Any) -> tuple[str, str]:
@@ -453,8 +453,93 @@ def _as_diff_lines(raw: Any) -> list[str]:
     hunk_header_re = re.compile(
         r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(?:\s.*)?$"
     )
+
+    def first_record_continues_hunk_header(
+            header: str, remaining_chunks: Sequence[str]) -> bool:
+        """Resolve an ambiguous hunk-header chunk boundary.
+
+        A chunk beginning with a diff prefix can be either the first body
+        record or a continuation of optional section text on the same physical
+        hunk-header line. Treat it as section text only when concatenating the
+        first physical record still forms a valid header *and* the remaining
+        body consumes exactly the header's declared old/new counts. Otherwise
+        the caller keeps the conservative body-record interpretation.
+        """
+        tail = "".join(remaining_chunks).replace("\r\r\n", "\r\n")
+        records = tail.splitlines(keepends=True)
+        if not records or not records[0].endswith(("\r", "\n")):
+            return False
+        continued_header = header + records[0].rstrip("\r\n")
+        match = _HUNK_HEADER.fullmatch(continued_header)
+        if match is None:
+            return False
+
+        expected_old = int(match.group("old_count") or 1)
+        expected_new = int(match.group("new_count") or 1)
+        used_old = used_new = 0
+        for record in records[1:]:
+            control = record.rstrip("\r\n")
+            if (_HUNK_HEADER.fullmatch(control)
+                    or (control.startswith("====")
+                        and _FILE_HEADER.fullmatch(control))):
+                break
+            if control == r"\ No newline at end of file":
+                continue
+            prefix = record[:1]
+            if prefix == " ":
+                used_old += 1
+                used_new += 1
+            elif prefix == "-":
+                used_old += 1
+            elif prefix == "+":
+                used_new += 1
+            else:
+                return False
+            if used_old > expected_old or used_new > expected_new:
+                return False
+        return used_old == expected_old and used_new == expected_new
+
+    def current_hunk_consumes_declared_counts(parts: Sequence[str]) -> bool:
+        """Whether the unfinished stream already contains one complete hunk."""
+        records = "".join(parts).replace("\r\r\n", "\r\n").splitlines(
+            keepends=True)
+        latest_match: Optional[re.Match[str]] = None
+        latest_index = -1
+        for index, record in enumerate(records):
+            control = record.rstrip("\r\n")
+            if control.startswith("====") and _FILE_HEADER.fullmatch(control):
+                latest_match = None
+                latest_index = -1
+                continue
+            match = _HUNK_HEADER.fullmatch(control)
+            if match is not None:
+                latest_match = match
+                latest_index = index
+        if latest_match is None:
+            return False
+        expected_old = int(latest_match.group("old_count") or 1)
+        expected_new = int(latest_match.group("new_count") or 1)
+        used_old = used_new = 0
+        for record in records[latest_index + 1:]:
+            control = record.rstrip("\r\n")
+            if control == r"\ No newline at end of file":
+                continue
+            prefix = record[:1]
+            if prefix == " ":
+                used_old += 1
+                used_new += 1
+            elif prefix == "-":
+                used_old += 1
+            elif prefix == "+":
+                used_new += 1
+            else:
+                return False
+            if used_old > expected_old or used_new > expected_new:
+                return False
+        return used_old == expected_old and used_new == expected_new
+
     joined_parts: list[str] = []
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks):
         if joined_parts and chunk:
             # Empty records can occur between a header and its body. They do
             # not represent a byte boundary, so inspect the latest non-empty
@@ -473,7 +558,9 @@ def _as_diff_lines(raw: Any) -> list[str]:
                 previous_control = previous_record
                 if hunk_header_re.fullmatch(previous_control) \
                         and chunk.startswith((" ", "+", "-", "\\ No newline")):
-                    joined_parts.append("\n")
+                    if not first_record_continues_hunk_header(
+                            previous_control, chunks[chunk_index:]):
+                        joined_parts.append("\n")
                 # A hunk header cannot be source content: unified source
                 # records always begin with a space, '+' or '-'. Restore a
                 # missing record separator when P4Python returns consecutive
@@ -499,13 +586,18 @@ def _as_diff_lines(raw: Any) -> list[str]:
                 elif (_FILE_HEADER.fullmatch(next_record)
                       and (previous_control.startswith((" ", "+", "-", "\\ No newline"))
                            or hunk_header_re.fullmatch(previous_control))
-                      and re.search(r"(?m)^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@",
-                                    "".join(joined_parts))):
+                      and previous_control not in {" ", "+", "-"}
+                      and current_hunk_consumes_declared_counts(joined_parts)):
                     # A complete column-zero file header cannot be the next
                     # record of a unified hunk (source lines carry a diff
-                    # prefix). Restrict this inference to a preceding diff
-                    # record so an un-terminated raw add-file body containing
-                    # header-like text is not split speculatively.
+                    # prefix). A prefix-only preceding record is ambiguous:
+                    # the chunk may have split immediately after that prefix,
+                    # making this apparent header ordinary source content.
+                    # Keep that byte stream intact instead of fabricating a
+                    # boundary. Restrict all remaining inference to a
+                    # preceding diff record so an un-terminated raw add-file
+                    # body containing header-like text is not split
+                    # speculatively.
                     joined_parts.append("\n")
         joined_parts.append(chunk)
     joined = "".join(joined_parts)
@@ -713,6 +805,7 @@ def _reconcile_metadata(
             )
             if content_bytes > max_bytes:
                 item.update({
+                    "hunks": [],
                     "supported": False,
                     "complete": False,
                     "reason": f"parsed diff exceeds max_bytes={max_bytes}",
@@ -721,6 +814,7 @@ def _reconcile_metadata(
         # section.  It is not safe to attach a line comment to it.
         if "binary" in file_type:
             item.update({
+                "hunks": [],
                 "binary": True,
                 "supported": False,
                 "complete": False,
@@ -790,6 +884,7 @@ def parse_unified_diff(
     body_started = False
     post_hunk_invalid = False
     left_cursor = right_cursor = 0
+    hunk_old_used = hunk_new_used = 0
     pending_old_header: Optional[str] = None
 
     def mark_invalid(reason: str) -> None:
@@ -800,15 +895,15 @@ def parse_unified_diff(
             current.setdefault("reason", reason)
 
     def finish_hunk() -> None:
-        nonlocal hunk
+        nonlocal hunk, hunk_old_used, hunk_new_used
         if hunk is None:
             return
         if current is None:
             hunk = None
+            hunk_old_used = hunk_new_used = 0
             return
-        old_used = sum(line.get("kind") in {"context", "delete"} for line in hunk["lines"])
-        new_used = sum(line.get("kind") in {"context", "add"} for line in hunk["lines"])
-        if old_used != hunk["oldLines"] or new_used != hunk["newLines"]:
+        if (hunk_old_used != hunk["oldLines"]
+                or hunk_new_used != hunk["newLines"]):
             hunk["complete"] = False
             mark_invalid("unified hunk line counts do not match its header")
         elif hunk.get("complete", True) is False:
@@ -817,6 +912,7 @@ def parse_unified_diff(
             hunk["complete"] = True
         current.setdefault("hunks", []).append(hunk)
         hunk = None
+        hunk_old_used = hunk_new_used = 0
 
     def finish_file(*, section_separator: bool = False) -> None:
         nonlocal current, body_lines, body_started, post_hunk_invalid
@@ -888,6 +984,10 @@ def parse_unified_diff(
             mark_invalid("unified diff has no valid depot file header")
         current["supported"] = bool(current.get("supported", True))
         current["binary"] = bool(current.get("binary", False))
+        if current["binary"]:
+            # A later P4 binary marker is authoritative even when text-looking
+            # hunks preceded it. Never leak those unsafe partial hunks.
+            current["hunks"] = []
         has_representation = bool(current.get("hunks")) or valid_empty_add
         current["complete"] = bool(
             current["supported"]
@@ -1049,6 +1149,7 @@ def parse_unified_diff(
                 hunk["complete"] = False
                 mark_invalid("unified hunk has a non-empty range starting at line zero")
             left_cursor, right_cursor = old_start, new_start
+            hunk_old_used = hunk_new_used = 0
             body_lines = []
             body_started = True
             post_hunk_invalid = False
@@ -1107,13 +1208,12 @@ def parse_unified_diff(
         if not raw_line:
             mark_invalid("empty line inside unified hunk")
             continue
-        old_used = sum(line.get("kind") in {"context", "delete"} for line in hunk["lines"])
-        new_used = sum(line.get("kind") in {"context", "add"} for line in hunk["lines"])
         # Some P4 output paths strip the leading space from an empty context
         # line, leaving only its line terminator.  It is still a legitimate
         # context line when the hunk counts allow one.
         if control == "":
-            if old_used >= hunk["oldLines"] or new_used >= hunk["newLines"]:
+            if (hunk_old_used >= hunk["oldLines"]
+                    or hunk_new_used >= hunk["newLines"]):
                 mark_invalid("unified hunk contains more lines than its header")
                 continue
             # Keep the raw record rather than the stripped control value.  A
@@ -1125,34 +1225,40 @@ def parse_unified_diff(
                 _diff_line(raw_line, "context", left_cursor, right_cursor))
             left_cursor += 1
             right_cursor += 1
+            hunk_old_used += 1
+            hunk_new_used += 1
         else:
             prefix, content = raw_line[0], raw_line[1:]
             if prefix == " ":
-                if old_used >= hunk["oldLines"] or new_used >= hunk["newLines"]:
+                if (hunk_old_used >= hunk["oldLines"]
+                        or hunk_new_used >= hunk["newLines"]):
                     mark_invalid("unified hunk contains more lines than its header")
                     continue
                 hunk["lines"].append(_diff_line(content, "context", left_cursor, right_cursor))
                 left_cursor += 1
                 right_cursor += 1
+                hunk_old_used += 1
+                hunk_new_used += 1
             elif prefix == "-":
-                if old_used >= hunk["oldLines"]:
+                if hunk_old_used >= hunk["oldLines"]:
                     mark_invalid("unified hunk contains more old-side lines than its header")
                     continue
                 hunk["lines"].append(_diff_line(content, "delete", left_cursor, None))
                 left_cursor += 1
+                hunk_old_used += 1
             elif prefix == "+":
-                if new_used >= hunk["newLines"]:
+                if hunk_new_used >= hunk["newLines"]:
                     mark_invalid("unified hunk contains more new-side lines than its header")
                     continue
                 hunk["lines"].append(_diff_line(content, "add", None, right_cursor))
                 right_cursor += 1
+                hunk_new_used += 1
             else:
                 mark_invalid("unexpected line inside unified hunk")
                 continue
 
-        old_used = sum(line.get("kind") in {"context", "delete"} for line in hunk["lines"])
-        new_used = sum(line.get("kind") in {"context", "add"} for line in hunk["lines"])
-        if old_used == hunk["oldLines"] and new_used == hunk["newLines"]:
+        if (hunk_old_used == hunk["oldLines"]
+                and hunk_new_used == hunk["newLines"]):
             finish_hunk()
 
     finish_file(section_separator=False)
@@ -1173,6 +1279,7 @@ def parse_unified_diff(
             )
             if content_bytes > max_bytes:
                 file_entry.update({
+                    "hunks": [],
                     "supported": False,
                     "complete": False,
                     "reason": f"parsed diff exceeds max_bytes={max_bytes}",

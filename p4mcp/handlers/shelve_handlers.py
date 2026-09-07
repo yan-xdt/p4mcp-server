@@ -26,6 +26,8 @@ class ShelvesHandlers:
                     context_lines=getattr(params, "context_lines", 3),
                     max_files=getattr(params, "max_files", 200),
                     max_bytes=getattr(params, "max_bytes", 5_000_000),
+                    after_file=getattr(params, "after_file", None),
+                    max_total_bytes=getattr(params, "max_total_bytes", 10_000_000),
                 )
             else:
                 # Preserve the old one-argument call for downstream service
