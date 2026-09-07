@@ -75,7 +75,7 @@ def register(server: "P4MCPServer") -> None:
         )] = 3,
         max_files: Annotated[int, Field(
             default=200, ge=1, le=1000,
-            description="Maximum files in one structured-diff page; applied before content is read",
+            description="Maximum files in one metadata/diff page; applied before content is read",
         )] = 200,
         max_bytes: Annotated[int, Field(
             default=5_000_000, ge=1, le=100_000_000,
@@ -84,14 +84,35 @@ def register(server: "P4MCPServer") -> None:
         after_file: Annotated[Optional[str], Field(
             default=None,
             description=(
-                "Exclusive structured-diff cursor: exact depot path from the "
+                "Exclusive file-page cursor: exact depot path from the "
                 "preceding page's lastSeen field"
             ),
         )] = None,
         max_total_bytes: Annotated[int, Field(
             default=10_000_000, ge=65_536, le=100_000_000,
-            description="Hard UTF-8 JSON byte budget for one structured-diff payload",
+            description="Hard UTF-8 JSON byte budget for one file metadata/diff page",
         )] = 10_000_000,
+        exclude_types: Annotated[Optional[List[str]], Field(
+            default=None,
+            description=(
+                "P4 file types to exclude before paging/content reads; "
+                "use ['binary'] to omit binary variants"
+            ),
+        )] = None,
+        exclude_globs: Annotated[Optional[List[str]], Field(
+            default=None,
+            description=(
+                "Case-sensitive depot-path globs to exclude before paging/content reads"
+            ),
+            examples=[["**/*.meta", "**/*.prefab"]],
+        )] = None,
+        expected_inventory_fingerprint: Annotated[Optional[str], Field(
+            default=None,
+            pattern=r"^[0-9a-fA-F]{64}$",
+            description=(
+                "Inventory fingerprint from the first page; mismatch fails closed"
+            ),
+        )] = None,
         max_results: Annotated[int, Field(
             default=10,
             description="Maximum number of results to return",
@@ -154,6 +175,8 @@ def register(server: "P4MCPServer") -> None:
             to_version=to_version, structured=structured, max_results=max_results,
             context_lines=context_lines, max_files=max_files, max_bytes=max_bytes,
             after_file=after_file, max_total_bytes=max_total_bytes,
+            exclude_types=exclude_types, exclude_globs=exclude_globs,
+            expected_inventory_fingerprint=expected_inventory_fingerprint,
             after=after, after_updated=after_updated,
             result_order=result_order, projects=projects,
             state=state, keywords=keywords,

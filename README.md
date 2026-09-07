@@ -1081,15 +1081,19 @@ Submitted changes and an empty/malformed shelf fail closed.
 - **Parameters**: 
   - `review_id` - Review ID (required for get, transitions, files_readby, files, diff, comments, activity)
   - `fields` - Fields to return for list/get (for example, `id`, `description`, `author`, `state`); list cannot return `versions`, so enumerate IDs and call get
-  - `comments_fields` - Fields for comments (default: "id,body,user,time")
+  - `comments_fields` - Comma-separated fields sent to the comments endpoint (default: "id,body,user,time")
   - `up_voters` - List of up voters for transitions
   - `from_version`, `to_version` - Version range for files/diff actions
   - `structured` - With `files`, switch from metadata-only output to structured hunks
-  - `context_lines`, `max_files`, `max_bytes`, `after_file`, `max_total_bytes` - Structured diff context, paging, and hard limits
+  - `context_lines`, `max_files`, `max_bytes`, `after_file`, `max_total_bytes` - File metadata/diff context, paging, and hard limits
+  - `exclude_types`, `exclude_globs` - Exclude P4 types or case-sensitive depot-path globs before paging and any content reads
+  - `expected_inventory_fingerprint` - Require the fingerprint returned by the first page; mismatch fails closed and requires a restart
   - `max_results` - Maximum results (default: 10)
 - **Use cases**: Code review discovery, review status tracking, comment retrieval, review activity monitoring
 
-`files` remains the backwards-compatible metadata response by default. Use
+`files` remains metadata-only by default. Its inventory is filtered and paged
+locally with `max_files`/`after_file`, and it returns the same
+`inventoryFingerprint` continuation token as structured pages. Use
 `structured=true` with `files`, or use `diff` (which is always structured), to receive `files[].hunks` and
 per-line `kind`/`side` records with nullable `leftLine` and `rightLine` values.
 The line `content` is preserved exactly, including indentation and trailing
@@ -1109,6 +1113,14 @@ compact JSON payload. Continue with `lastSeen` while `hasMore=true`; do not use
 `complete` alone as the pagination stop condition. A cursor missing from the
 current inventory fails closed with `restartRequired=true` because the shelf
 may have changed.
+
+For automated scans, pass repeatable `exclude_types`/`exclude_globs` values
+such as `binary`, `**/*.meta`, and `**/*.prefab`. Filtering happens against the
+complete metadata inventory before `max_files` and before any `diff2`/`print`;
+the response's `fileFilters` records the rules and excluded counts. Persist the
+first page's `inventoryFingerprint` and send it as
+`expected_inventory_fingerprint` on every continuation page. This is an
+optimistic consistency check, not a server-side lock.
 
 For the default (latest) pending review diff, the selected source is strictly
 `versions[-1].change`; that version must be known to be pending (the latest
