@@ -1030,7 +1030,7 @@ The MCP server checks properties in this order. Each property is resolved indepe
   - `list` - List shelved changes by user or globally
   - `diff` - Show differences in shelved files; use `structured=true` for line-addressable hunks
   - `files` - List files in a specific shelf
-- **Parameters**: `changelist_id`, `user`, `structured`, `context_lines`, `max_files`, `max_bytes`, `max_results`
+- **Parameters**: `changelist_id`, `user`, `structured`, `context_lines`, `max_files`, `max_bytes`, `after_file`, `max_total_bytes`, `max_results`
 - **Use cases**: Code review, work-in-progress tracking, collaboration
 
 `diff` keeps the legacy `list[str]` P4 output when `structured=false`. With
@@ -1038,11 +1038,17 @@ The MCP server checks properties in this order. Each property is resolved indepe
 `leftLine`/`rightLine` anchors. Additions and deletions use a nullable
 one-sided anchor; binary files, unknown actions, missing sections, and files
 that exceed a limit are returned with `supported=false`, `complete=false`, and
-an explanatory `reason`. `complete=false` is also set when `max_files` omits
-files (listed in `omittedFiles`). `max_files` and `max_bytes` bound expansion
-and parsing, not the total amount of data the P4 server may read.
+an explanatory `reason`, with no partial hunks retained. Structured mode first
+loads `p4 describe -s -S` metadata, sorts it by depot path, applies
+`after_file`/`max_files`, and only then reads the selected files one at a time;
+it never fetches a whole-shelf `describe -du` response. `max_bytes` is a
+streaming per-file limit, while `max_total_bytes` is the compact UTF-8 JSON
+budget for a page. Continue while `hasMore=true`, passing the exact `lastSeen`
+path as the next `after_file`. `pageComplete` describes the returned page;
+legacy `complete` is true only when that page is complete and no files remain.
+`inventoryFingerprint` must remain the same across pages.
 
-For a structured shelf diff, the tagged `describe -S` record must identify the
+For a structured shelf diff, the tagged `describe -s -S` record must identify the
 requested changelist, have `status=pending`, and contain concrete depot files.
 Submitted changes and an empty/malformed shelf fail closed.
 
@@ -1074,12 +1080,12 @@ Submitted changes and an empty/malformed shelf fail closed.
   - `comments` - Get comments on a review
 - **Parameters**: 
   - `review_id` - Review ID (required for get, transitions, files_readby, files, diff, comments, activity)
-  - `fields` - Fields to return for list/get (for example, `id`, `description`, `author`, `state`)
+  - `fields` - Fields to return for list/get (for example, `id`, `description`, `author`, `state`); list cannot return `versions`, so enumerate IDs and call get
   - `comments_fields` - Fields for comments (default: "id,body,user,time")
   - `up_voters` - List of up voters for transitions
   - `from_version`, `to_version` - Version range for files/diff actions
   - `structured` - With `files`, switch from metadata-only output to structured hunks
-  - `context_lines`, `max_files`, `max_bytes` - Structured diff context and limits
+  - `context_lines`, `max_files`, `max_bytes`, `after_file`, `max_total_bytes` - Structured diff context, paging, and hard limits
   - `max_results` - Maximum results (default: 10)
 - **Use cases**: Code review discovery, review status tracking, comment retrieval, review activity monitoring
 
@@ -1096,6 +1102,14 @@ unknown-action, missing-section, and incomplete records are explicit and never
 receive a synthetic line number. The top-level result reports `sourceChange`,
 which is the selected version's changelist.
 
+Structured review diffs use the same file-page contract as structured shelf
+diffs: content is read only after `after_file`/`max_files` select the page,
+`max_bytes` bounds each P4 output stream, and `max_total_bytes` bounds the
+compact JSON payload. Continue with `lastSeen` while `hasMore=true`; do not use
+`complete` alone as the pagination stop condition. A cursor missing from the
+current inventory fails closed with `restartRequired=true` because the shelf
+may have changed.
+
 For the default (latest) pending review diff, the selected source is strictly
 `versions[-1].change`; that version must be known to be pending (the latest
 version's flag is preferred, with the top-level pending flag used only when a
@@ -1105,6 +1119,12 @@ fresh metadata. The corresponding P4 shelf must be a matching pending
 changelist with files.
 The implementation never falls back to `changes[0]`. A submitted, missing, or
 ambiguous shelf returns an error instead of an apparently complete diff.
+
+For `get`, `include_transitions=true` calls the dedicated
+`/reviews/{id}/transitions` endpoint and merges `transitions`/`blocked` into
+the review object. The query-string form is not used because supported Swarm
+v11 servers ignore it. Review-list state filters use `approved:notPending` for
+submitted reviews; `committed` remains a transition name, not a list filter.
 
 </details>
 

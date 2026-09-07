@@ -20,12 +20,16 @@ from typing import List, Dict, Any, Optional, Mapping
 from P4 import P4Exception
 
 from ..core.connection import P4ConnectionManager
-from .review_diff import build_hunks, change_kind, looks_binary, parse_unified_diff
+from .review_diff import change_kind
+from .structured_diff import (
+    DEFAULT_MAX_TOTAL_BYTES,
+    MIN_MAX_TOTAL_BYTES,
+    StructuredDiffPage,
+    build_structured_file,
+    prepare_diff_page,
+)
 
 logger = logging.getLogger(__name__)
-
-_MAX_STRUCTURED_DIFF_OUTPUT_BYTES = 64 * 1024 * 1024
-
 
 def _expand_describe_files(records: Any) -> list[dict[str, Any]]:
     """Expand P4 tagged describe arrays into one metadata object per file."""
@@ -169,24 +173,6 @@ def _validate_pending_shelf(records: Any, changelist_id: str) -> list[dict[str, 
     return files
 
 
-def _output_size(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, str):
-        return len(value.encode("utf-8"))
-    if isinstance(value, (bytes, bytearray)):
-        return len(value)
-    if isinstance(value, (list, tuple)):
-        total = 0
-        for item in value:
-            if isinstance(item, str):
-                total += len(item.encode("utf-8"))
-            elif isinstance(item, (bytes, bytearray)):
-                total += len(item)
-        return total
-    return 0
-
-
 def _check_p4_output(p4: Any, result: Any, command: str) -> None:
     """Fail closed when P4 suppresses an error at a low exception level."""
     errors = getattr(p4, "errors", None) or []
@@ -216,45 +202,6 @@ def _check_p4_output(p4: Any, result: Any, command: str) -> None:
         raise ValueError(f"{command} returned P4 diagnostics: {detail}")
 
 
-async def _read_revision_bytes(p4: Any, spec: str, max_bytes: int) -> bytes:
-    """Read one depot/shelf revision for add/delete anchor recovery."""
-    if not spec:
-        raise ValueError("a revision spec is required")
-    previous_tagged = getattr(p4, "tagged", True)
-    try:
-        p4.tagged = False
-        result = p4.run("print", "-q", spec)
-        _check_p4_output(p4, result, f"p4 print {spec}")
-    finally:
-        p4.tagged = previous_tagged
-    if result is None:
-        result = []
-    if isinstance(result, (str, bytes, bytearray)):
-        result = [result]
-    if not isinstance(result, (list, tuple)):
-        raise ValueError(f"p4 print {spec} returned malformed output")
-    chunks: list[bytes] = []
-    total = 0
-    for item in result:
-        if isinstance(item, (bytes, bytearray)):
-            chunk = bytes(item)
-        elif isinstance(item, str):
-            chunk = item.encode("utf-8")
-        else:
-            raise ValueError(f"p4 print {spec} returned a non-text chunk")
-        total += len(chunk)
-        if total > max_bytes:
-            raise ValueError(f"revision exceeds max_bytes={max_bytes}")
-        chunks.append(chunk)
-    if not chunks:
-        diagnostics = " ".join(str(message).lower()
-                                for message in (getattr(p4, "messages", None) or []))
-        if any(marker in diagnostics for marker in (
-                "no such", "not found", "does not exist", "unknown file",
-                "no file", "not on client", "revision does not exist")):
-            raise ValueError(f"p4 print {spec} reported a missing revision")
-    return b"".join(chunks)
-
 class ShelveServices:
     """Shelve services for shelve operations"""
     
@@ -282,212 +229,109 @@ class ShelveServices:
             context_lines: int = 3,
             max_files: int = 200,
             max_bytes: int = 5_000_000,
+            after_file: Optional[str] = None,
+            max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
         ) -> Dict[str, Any]:
-        """Get a shelved changelist diff.
-
-        The historical response (``structured=False``) is left untouched and
-        remains the P4Python ``list[str]`` output.  Opting into structured mode
-        switches to unified diff output and parses it into file/hunk/line
-        records with explicit left/right anchors.  ``context_lines`` is passed
-        to P4's ``-duN`` option and is also used when trimming/rebuilding the
-        parsed hunks.
-        """
+        """Get a raw shelf diff or a bounded page of structured file hunks."""
         if context_lines < 0 or context_lines > 100:
             return {"status": "error", "message": "context_lines must be between 0 and 100"}
         if max_files < 1:
             return {"status": "error", "message": "max_files must be positive"}
         if max_bytes < 1:
             return {"status": "error", "message": "max_bytes must be positive"}
+        if max_total_bytes < MIN_MAX_TOTAL_BYTES:
+            return {
+                "status": "error",
+                "message": f"max_total_bytes must be at least {MIN_MAX_TOTAL_BYTES}",
+            }
+
         async with self.connection_manager.get_connection() as p4:
             current_tag = getattr(p4, "tagged", True)
             try:
                 if not structured:
                     p4.tagged = False
-                    # ``-dw`` is the historical normal/ed diff contract.
+                    # Preserve the historical normal/ed diff response exactly.
                     diff = p4.run("describe", "-a", "-S", "-dw", changelist_id)
                     return {"status": "success", "message": diff}
 
-                # Fetch the tagged file inventory separately.  describe's
-                # unified output intentionally omits deletes and binary files;
-                # the inventory is the authority used to mark those gaps.
+                # -s explicitly suppresses diff content. Apply the cursor and
+                # max_files to this lightweight inventory before issuing any
+                # per-file diff2/print command.
                 p4.tagged = True
                 runner = getattr(p4, "run_describe", None)
-                records = (runner("-S", str(changelist_id)) if callable(runner)
-                           else p4.run("describe", "-S", str(changelist_id)))
-                _check_p4_output(
-                    p4, records, f"p4 describe -S {changelist_id}")
-                metadata = _validate_pending_shelf(records, str(changelist_id))
-                p4.tagged = False
-                diff = p4.run(
-                    "describe", "-a", "-S", f"-du{context_lines}", changelist_id)
-                _check_p4_output(
-                    p4, diff, f"p4 describe -du{context_lines} -S {changelist_id}")
-                if _output_size(diff) > _MAX_STRUCTURED_DIFF_OUTPUT_BYTES:
-                    raise ValueError(
-                        "structured shelf diff exceeds the server response safety limit "
-                        f"({_MAX_STRUCTURED_DIFF_OUTPUT_BYTES} bytes)")
-                parsed = parse_unified_diff(
-                    diff,
-                    context_lines=context_lines,
-                    metadata={"files": metadata},
-                    max_bytes=max_bytes,
+                records = (
+                    runner("-s", "-S", str(changelist_id))
+                    if callable(runner)
+                    else p4.run("describe", "-s", "-S", str(changelist_id))
                 )
-                # Some p4d versions emit only a ``====`` header for text
-                # adds/deletes (and occasionally edits) in ``describe -du``.
-                # The tagged inventory tells us which side exists; read that
-                # side explicitly so the structured response still contains
-                # safe one-sided anchors.  Binary files remain unsupported.
-                parsed_files = list(parsed.get("files") or [])
-                metadata_by_path = {
-                    item.get("depotFile"): item for item in metadata
-                    if item.get("depotFile")
-                }
-                recoverable_reasons = {
-                    "no unified diff section",
-                    "added file section has no diff content",
-                    "file section has no diff content",
-                    "file section has no unified hunk",
-                }
-                for item in parsed_files[:max_files]:
-                    if item.get("supported", False) or item.get("binary"):
-                        continue
-                    if item.get("hunks"):
-                        continue
-                    if item.get("reason") not in recoverable_reasons:
-                        continue
-                    path = item.get("depotFile")
-                    metadata_item = metadata_by_path.get(path, {})
-                    action = metadata_item.get("action", item.get("action"))
-                    kind = change_kind(action)
-                    if kind == "unknown" or action is None or not str(action).strip():
-                        item["reason"] = "missing or unsupported file action"
-                        continue
-                    declared_type = str(
-                        metadata_item.get("type") or item.get("type") or ""
-                    ).lower()
-                    if "binary" in declared_type:
-                        item.update({
-                            "binary": True,
-                            "supported": False,
-                            "complete": False,
-                            "reason": "binary file; line diff unavailable",
-                        })
-                        continue
-                    try:
-                        revision = int(metadata_item.get("rev"))
-                    except (TypeError, ValueError):
-                        revision = 0
-                    if kind == "add":
-                        left_spec = None
-                        right_spec = f"{path}@={changelist_id}" if path else None
-                    elif kind == "delete":
-                        left_spec = f"{path}#{revision}" if path and revision > 0 else None
-                        right_spec = None
-                    else:
-                        left_spec = f"{path}#{revision}" if path and revision > 0 else None
-                        right_spec = f"{path}@={changelist_id}" if path else None
-                    if ((kind == "add" and right_spec is None)
-                            or (kind == "delete" and left_spec is None)
-                            or (kind == "edit" and (left_spec is None or right_spec is None))):
-                        item["reason"] = "missing reliable revision reference for recovery"
-                        continue
-                    try:
-                        left_bytes = await _read_revision_bytes(
-                            p4, left_spec, max_bytes) if left_spec else b""
-                        right_bytes = await _read_revision_bytes(
-                            p4, right_spec, max_bytes) if right_spec else b""
-                        if looks_binary(left_bytes, declared_type) or looks_binary(
-                                right_bytes, declared_type):
-                            item.update({
-                                "binary": True,
-                                "supported": False,
-                                "complete": False,
-                                "reason": "binary content detected; line diff unavailable",
-                            })
-                            continue
-                        recovered = build_hunks(left_bytes, right_bytes, context_lines)
-                        item.update(recovered)
-                        item.update({
-                            "action": action,
-                            "type": metadata_item.get("type", item.get("type")),
-                            "source": "p4-print-shelf",
-                            "binary": False,
-                            "supported": True,
-                            "complete": True,
-                            "fromRevision": f"#{revision}" if left_spec else None,
-                            "toRevision": f"@={changelist_id}" if right_spec else None,
-                            "recoveredFromMissingSection": True,
-                        })
-                        # The initial parser reason is no longer true after a
-                        # successful p4 print recovery.
-                        item.pop("reason", None)
-                        if "utf-8-replace" in {
-                                recovered.get("oldEncoding"), recovered.get("newEncoding")}:
-                            item.update({
-                                "supported": False,
-                                "complete": False,
-                                "reason": "content could not be decoded without replacement",
-                                "encodingWarning": True,
-                            })
-                    except Exception as recovery_error:
-                        item["reason"] = str(recovery_error)
+                _check_p4_output(
+                    p4, records, f"p4 describe -s -S {changelist_id}")
+                metadata = _validate_pending_shelf(records, str(changelist_id))
+                try:
+                    plan = prepare_diff_page(
+                        metadata,
+                        max_files,
+                        after_file,
+                        inventory_identity={
+                            "kind": "shelf",
+                            "change": str(changelist_id),
+                        },
+                    )
+                except ValueError as exc:
+                    return {
+                        "status": "error",
+                        "message": {
+                            "stage": "file-pagination",
+                            "changelist": str(changelist_id),
+                            "detail": str(exc),
+                            "restartRequired": after_file is not None,
+                        },
+                    }
 
-                # Rebuild the parser's aggregate fields after recovery.  The
-                # parser initially marked these entries as missing; retaining
-                # that stale flag would report ``complete=false`` even when
-                # every omitted add/delete was recovered successfully.
-                recovered_missing = set(parsed.get("missingFiles") or [])
-                for item in parsed_files:
-                    if item.get("supported") and item.get("complete"):
-                        recovered_missing.discard(item.get("depotFile"))
-                if recovered_missing:
-                    parsed["missingFiles"] = sorted(recovered_missing)
-                else:
-                    parsed.pop("missingFiles", None)
-                parsed["complete"] = bool(parsed_files) and all(
-                    item.get("supported", False) and item.get("complete", False)
-                    for item in parsed_files
-                ) and not parsed.get("limited") and not parsed.get("unexpectedFiles")
-                omitted_entries = metadata[max_files:]
-                files = parsed_files[:max_files]
-                for item in files:
-                    metadata_item = metadata_by_path.get(item.get("depotFile"), {})
-                    _apply_shelf_revision_refs(
-                        item, metadata_item, str(changelist_id))
-                    # Keep the more specific recovery origin on entries that
-                    # required p4 print; ordinary parsed sections originate
-                    # from describe's unified stream.
-                    item.setdefault("source", "p4-describe-shelf")
-                parsed["files"] = files
-                parsed.update({
+                page = StructuredDiffPage(plan, max_total_bytes)
+                for entry in plan.candidates:
+                    item = await build_structured_file(
+                        p4,
+                        entry,
+                        target_pending=True,
+                        to_change=str(changelist_id),
+                        from_change=None,
+                        effective_from=None,
+                        context_lines=context_lines,
+                        max_bytes=max_bytes,
+                        check_output=_check_p4_output,
+                    )
+                    if not page.append(item) or page.budget_limited:
+                        break
+
+                base = {
                     "changelist": str(changelist_id),
                     "shelfPresent": True,
                     "contextLines": context_lines,
                     "maxFiles": max_files,
                     "maxBytes": max_bytes,
-                    "complete": bool(parsed.get("complete")) and not omitted_entries,
-                    "source": "p4-describe-shelf",
-                })
-                if omitted_entries:
-                    parsed["omittedFiles"] = [
-                        item.get("depotFile") for item in omitted_entries
-                    ]
-                unsupported = [
-                    {"depotFile": item.get("depotFile"), "reason": item.get("reason")}
-                    for item in files if not item.get("supported", False)
-                ]
-                if unsupported:
-                    parsed["errors"] = unsupported
-                # Raw chunks are an implementation detail.  Returning them
-                # would duplicate large shelf contents in the MCP response and
-                # bypass the structured output limits.
-                parsed.pop("raw", None)
+                    "source": "p4-shelf-files",
+                    "warnings": [],
+                }
+                try:
+                    parsed = page.finish(base)
+                except ValueError as exc:
+                    return {
+                        "status": "error",
+                        "message": {
+                            "stage": "response-budget",
+                            "changelist": str(changelist_id),
+                            "detail": str(exc),
+                        },
+                    }
                 return {"status": "success", "message": parsed}
             except P4Exception as e:
-                logger.error(f"P4Error: Failed to get shelve diff for changelist '{changelist_id}': {e}")
+                logger.error(
+                    f"P4Error: Failed to get shelve diff for changelist '{changelist_id}': {e}")
                 return {"status": "error", "message": str(e)}
             except Exception as e:
-                logger.error(f"Failed to parse shelve diff for changelist '{changelist_id}': {e}")
+                logger.error(
+                    f"Failed to parse shelve diff for changelist '{changelist_id}': {e}")
                 return {"status": "error", "message": str(e)}
             finally:
                 p4.tagged = current_tag

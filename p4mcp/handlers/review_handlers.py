@@ -70,6 +70,8 @@ class ReviewsHandlers:
                     getattr(params, "context_lines", 3),
                     getattr(params, "max_files", 200),
                     getattr(params, "max_bytes", 5_000_000),
+                    getattr(params, "after_file", None),
+                    getattr(params, "max_total_bytes", 10_000_000),
                 )
             else:
                 # get_review_files(review_id, from_version, to_version)
@@ -87,6 +89,8 @@ class ReviewsHandlers:
                 getattr(params, "context_lines", 3),
                 getattr(params, "max_files", 200),
                 getattr(params, "max_bytes", 5_000_000),
+                getattr(params, "after_file", None),
+                getattr(params, "max_total_bytes", 10_000_000),
             )
 
         elif params.action == "activity":

@@ -48,7 +48,10 @@ class QueryReviewsParams(PaginatedParams):
     )
     fields: Optional[List[str]] = Field(
         default=None,
-        description="List of fields to return for list/get actions",
+        description=(
+            "Fields to return for list/get actions. Swarm list does not expose "
+            "versions; enumerate IDs, then use get for version data."
+        ),
         examples=[["id", "description", "author", "state"], ["id", "author", "state", "participants", "commits"]],
     )
     comments_fields: Optional[str] = Field(
@@ -89,7 +92,7 @@ class QueryReviewsParams(PaginatedParams):
         default=200,
         ge=1,
         le=1000,
-        description="Maximum number of files to expand in a structured diff",
+        description="Maximum files in one structured-diff page; applied before content is read",
         examples=[50, 200],
     )
     max_bytes: int = Field(
@@ -98,6 +101,21 @@ class QueryReviewsParams(PaginatedParams):
         le=100_000_000,
         description="Maximum bytes to read per file in a structured diff",
         examples=[1000000, 5000000],
+    )
+    after_file: Optional[str] = Field(
+        default=None,
+        description=(
+            "Exclusive structured-diff file cursor. Pass the exact lastSeen "
+            "depot path from the preceding page."
+        ),
+        examples=["//depot/project/file.cpp"],
+    )
+    max_total_bytes: int = Field(
+        default=10_000_000,
+        ge=65_536,
+        le=100_000_000,
+        description="Hard UTF-8 JSON byte budget for one structured-diff payload",
+        examples=[1000000, 10000000],
     )
     max_results: Optional[int] = Field(
         default=10,
@@ -218,14 +236,14 @@ class CommentContext(BaseParams):
     leftLine: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Optional left-side diff line number. Deletion comments may use only leftLine. " \
-        "Valid only for changes and reviews topics."
+        description="Optional left-side diff line number. Swarm inline comments require " \
+        "leftLine and rightLine together. Valid only for changes and reviews topics."
     )
     rightLine: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Optional right-side diff line number. Addition comments may use only rightLine. " \
-        "Valid only for changes and reviews topics."
+        description="Optional right-side diff line number. Swarm inline comments require " \
+        "leftLine and rightLine together. Valid only for changes and reviews topics."
     )
     # NOTE: strip_whitespace=False is scoped to the content item type only so Swarm's
     # exact-line-match anchoring data (leading indentation + trailing '\n') survives
@@ -234,7 +252,7 @@ class CommentContext(BaseParams):
     content: Optional[List[Annotated[str, StringConstraints(strip_whitespace=False)]]] = Field(
         default=None,
         description="Optional array of exact Swarm context lines. Preserve trailing newlines; " \
-        "an inline context needs at least one leftLine or rightLine.",
+        "an inline context needs both leftLine and rightLine.",
         examples=[["line1\n", "line2\n", "line3\n", "line4\n", "line5\n"]]
     )
     version: Optional[int] = Field(
