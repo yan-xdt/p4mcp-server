@@ -236,11 +236,27 @@ def test_review_files_limited_flag_is_strict_but_accepts_numeric_boolean():
         _review_files_payload({"data": {"files": [], "limited": "bogus"}})
 
 
-def test_transition_fields_reject_missing_or_malformed_contract_data():
-    with pytest.raises(ValueError, match="malformed transitions"):
+def test_transition_fields_reject_missing_or_unsupported_contract_data():
+    with pytest.raises(ValueError, match="unsupported transitions shape"):
         _transition_fields({"data": {"transitions": None}})
-    with pytest.raises(ValueError, match="malformed blocked"):
+    with pytest.raises(ValueError, match="unsupported blocked shape"):
         _transition_fields({"data": {"transitions": {}, "blocked": None}})
+
+
+@pytest.mark.parametrize("blocked", [
+    [],
+    {"approved": {"votesNeeded": {"users": ["zhangmo"]}}},
+])
+def test_transition_fields_preserves_swarm_blocked_shapes(blocked):
+    result = _transition_fields({
+        "data": {
+            "transitions": {"needsRevision": "Needs Revision"},
+            "blocked": blocked,
+        },
+    })
+
+    assert result["transitions"] == {"needsRevision": "Needs Revision"}
+    assert result["blocked"] == blocked
 
 
 def test_review_reference_accepts_a_direct_field_limited_review_object():
@@ -492,7 +508,11 @@ def test_get_review_info_uses_independent_transitions_endpoint(monkeypatch):
         if url.endswith("/transitions"):
             return Response({"data": {
                 "transitions": {"needsReview": "Needs Review"},
-                "blocked": ["openTasks"],
+                "blocked": {
+                    "approved": {
+                        "votesNeeded": {"users": ["zhangmo"]},
+                    },
+                },
             }})
         return Response({"data": {"reviews": [{
             "id": 100, "state": "needsReview",
@@ -504,7 +524,9 @@ def test_get_review_info_uses_independent_transitions_endpoint(monkeypatch):
     assert result["status"] == "success"
     review = result["message"]["data"]["reviews"][0]
     assert review["transitions"] == {"needsReview": "Needs Review"}
-    assert review["blocked"] == ["openTasks"]
+    assert review["blocked"] == {
+        "approved": {"votesNeeded": {"users": ["zhangmo"]}},
+    }
     assert calls == [
         ("https://swarm.example/api/v11/reviews/100", None),
         ("https://swarm.example/api/v11/reviews/100/transitions", None),

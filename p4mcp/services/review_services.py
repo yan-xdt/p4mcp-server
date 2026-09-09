@@ -166,19 +166,31 @@ def _review_reference(payload: Any) -> Optional[dict[str, Any]]:
 
 
 def _transition_fields(payload: Any) -> dict[str, Any]:
-    """Extract the independent transitions endpoint's documented fields."""
+    """Extract the independent transitions endpoint's fields.
+
+    Swarm uses two JSON shapes for ``blocked``: an empty/list form when there
+    are no blocking reasons, and a state-keyed object when it can explain why
+    a transition is unavailable (for example, missing required votes). Keep
+    either valid shape intact instead of treating the explanatory object as a
+    malformed response.
+    """
     value = _payload_data(payload)
     if not isinstance(value, Mapping) or "transitions" not in value:
         raise ValueError("Swarm transitions response did not contain transitions")
     transitions = value.get("transitions")
     if not isinstance(transitions, Mapping):
-        raise ValueError("Swarm transitions response contained malformed transitions")
+        raise ValueError(
+            "Swarm transitions response contained an unsupported transitions shape")
     result = {"transitions": dict(transitions)}
     if "blocked" in value:
         blocked = value.get("blocked")
-        if not isinstance(blocked, list):
-            raise ValueError("Swarm transitions response contained malformed blocked data")
-        result["blocked"] = list(blocked)
+        if isinstance(blocked, list):
+            result["blocked"] = list(blocked)
+        elif isinstance(blocked, Mapping):
+            result["blocked"] = dict(blocked)
+        else:
+            raise ValueError(
+                "Swarm transitions response contained an unsupported blocked shape")
     return result
 
 

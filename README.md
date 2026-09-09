@@ -1134,9 +1134,12 @@ ambiguous shelf returns an error instead of an apparently complete diff.
 
 For `get`, `include_transitions=true` calls the dedicated
 `/reviews/{id}/transitions` endpoint and merges `transitions`/`blocked` into
-the review object. The query-string form is not used because supported Swarm
-v11 servers ignore it. Review-list state filters use `approved:notPending` for
-submitted reviews; `committed` remains a transition name, not a list filter.
+the review object. `blocked` is preserved as either Swarm's empty/list form or
+its state-keyed object form containing reasons such as missing required votes;
+only other shapes are rejected. The query-string form is not used because
+supported Swarm v11 servers ignore it. Review-list state filters use
+`approved:notPending` for submitted reviews; `committed` remains a transition
+name, not a list filter.
 
 </details>
 
